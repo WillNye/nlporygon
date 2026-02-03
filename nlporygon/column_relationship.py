@@ -137,7 +137,7 @@ async def create_column_bloom_map(
         )
         response[table.name] = {}
         for column in table.columns:
-            if column.name in config.column_relationships.ignore_columns_global_rule:
+            if column.name in config.column_relationships.global_ignore_column_rules:
                 continue
             elif is_date_or_dt_column(column.data_type):
                 continue

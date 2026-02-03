@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Callable, Optional, Any, Union
 
@@ -9,15 +10,18 @@ from pydantic import BaseModel, Field
 
 from nlporygon import SupportedDbType
 
-def is_empty_list(value):
+def is_empty_val(value):
     return not value
 
 
 class Database(BaseModel):
     name: str
-    database_type: SupportedDbType
     database_version: str | None
     connection: Any
+
+    @property
+    def database_type(self) -> SupportedDbType:
+        raise NotImplementedError
 
     async def execute(
         self,
@@ -28,9 +32,9 @@ class Database(BaseModel):
         raise NotImplementedError
 
 
-class ConfigRelationship(BaseModel):
-    # A global rule to ignore relationships for columns specified in this list
-    ignore_columns_global_rule: Optional[list[str]] = Field(default_factory=list, exclude_if=is_empty_list)
+class ColumnConfig(BaseModel):
+    # Global rules to ignore relationships for columns specified in this list
+    global_ignore_column_rules: Optional[list[str]] = Field(default_factory=list, exclude_if=is_empty_val)
 
     # Number of records to use when checking for a relationship between columns
     sample_size: Optional[int] = 20_000
@@ -42,9 +46,55 @@ class ConfigRelationship(BaseModel):
     error_rate: Optional[float] = 0.01
 
 
+class BaseTableRule(BaseModel):
+    # Explicit rules where only tables that match at least 1 provided regex
+    #   will be used for generating prompts
+    include_table_rules: Optional[list[str]] = Field(default_factory=list, exclude_if=is_empty_val)
+
+    # Rules to ignore tables matching any of the defined regexes when generating prompts.
+    # This also means tables that were a match on include_table_rules are ignored
+    #   if they match one of these.
+    ignore_table_rules: Optional[list[str]] = Field(default_factory=list, exclude_if=is_empty_val)
+
+    def get_matching_tables(self, tables: list[str]):
+        def _is_match(_t) -> bool:
+            if any(
+                re.match(r, _t, flags=re.IGNORECASE)
+                for r in self.ignore_table_rules
+            ):
+                return False
+
+            if not self.include_table_rules:
+                # Default behavior is to include all
+                return True
+
+            return any(
+                re.match(r, _t, flags=re.IGNORECASE)
+                for r in self.include_table_rules
+            )
+
+        return [t for t in tables if _is_match(t)]
+
+
+class TablePartitionConfig(BaseTableRule):
+    name: str
+    description: str
+
+
+class CommonTableRule(BaseTableRule):
+    pass
+
+
+class TableConfig(BaseTableRule):
+    common_tables: Optional[CommonTableRule] = Field(default_factory=CommonTableRule, exclude_if=is_empty_val)
+    partitions: Optional[list[TablePartitionConfig]] = Field(default_factory=list, exclude_if=is_empty_val)
+
+
 class Config(BaseModel):
-    column_relationships: ConfigRelationship
     output_path: Union[Path, str]
+
+    column_relationships: Optional[ColumnConfig] = Field(default_factory=ColumnConfig, exclude_if=is_empty_val)
+    table_config: Optional[TableConfig] = Field(default_factory=TableConfig, exclude_if=is_empty_val)
 
     @property
     def schema_path(self) -> Path:
@@ -98,7 +148,7 @@ class TableColumn(BaseModel):
     name: str
     data_type: str
 
-    relationships: Optional[list[ColumnRelationship]] = Field(default_factory=list, exclude_if=is_empty_list)
+    relationships: Optional[list[ColumnRelationship]] = Field(default_factory=list, exclude_if=is_empty_val)
     # Add context for columns where true value has been cast to another type
     # Example: "[1, 2, 3]"
     #   data_type would be VARCHAR
@@ -106,7 +156,7 @@ class TableColumn(BaseModel):
     # Now, the model will know to cast the column to INT[] before running a query
     sub_data_type: Optional[str] = Field(default=None)
     # Add visibility for keys on JSON columns
-    nested_columns: Optional[list["TableColumn"]] = Field(default_factory=list, exclude_if=is_empty_list)
+    nested_columns: Optional[list["TableColumn"]] = Field(default_factory=list, exclude_if=is_empty_val)
 
     @property
     def query_name(self) -> str:
@@ -117,8 +167,8 @@ class Table(BaseModel):
     name: str
     columns: list[TableColumn]
 
-    default_order: Optional[list[str]] = Field(default_factory=list, exclude_if=is_empty_list)
-    ignore_columns: Optional[list[str]] = Field(default_factory=list, exclude_if=is_empty_list)
+    default_order: Optional[list[str]] = Field(default_factory=list, exclude_if=is_empty_val)
+    ignore_columns: Optional[list[str]] = Field(default_factory=list, exclude_if=is_empty_val)
 
     async def write(self, path: Path):
         data = yaml.dump(

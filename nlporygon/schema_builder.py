@@ -181,7 +181,13 @@ async def _set_sub_data_type(
     table: Table,
     column: TableColumn,
 ):
-    def _upsert_nested_columns(_val: dict, key: str):
+    def _upsert_nested_columns(_val: Union[dict, list], key: str):
+        if isinstance(_val, list):
+            if len(_val) > 0 and isinstance(_val[0], dict):
+                _val = _val[0]
+            else:
+                return
+
         for k, v in _val.items():
             if v is None:
                 continue
@@ -204,7 +210,9 @@ async def _set_sub_data_type(
 
             if isinstance(v, dict) or isinstance(v, list):
                 _dt = _get_data_type(v)
-                if _dt.startswith("JSON"):
+                if not _dt:
+                    continue
+                elif _dt.startswith("JSON"):
                     _upsert_nested_columns(v, k)
             else:
                 _dt = PYTHON_TO_SQL_TYPE_MAP[type(v)]
