@@ -28,6 +28,7 @@ class Database(BaseModel):
     name: str
     database_version: str | None
     connection: Any
+    timeout: Optional[int] = 30
 
     @property
     def database_type(self) -> SupportedDbType:
@@ -106,9 +107,18 @@ class TableConfig(BaseTableRule):
     partitions: Optional[list[TablePartitionConfig]] = Field(default_factory=list, exclude_if=is_empty_val)
 
 
+class AgentConfig(BaseModel):
+    model_version: Optional[str] = "claude-sonnet-4-5-20250929"
+    max_tokens: Optional[int] = 2500
+    max_query_attempts: Optional[int] = 2
+    max_context_queries: Optional[int] = 3
+    timeout: Optional[int] = 10
+
+
 class Config(BaseModel):
     output_path: Union[Path, str]
 
+    agent_config: Optional[AgentConfig] = Field(default_factory=AgentConfig, exclude_if=is_empty_val)
     column_relationships: Optional[ColumnConfig] = Field(default_factory=ColumnConfig, exclude_if=is_empty_val)
     table_config: Optional[TableConfig] = Field(default_factory=TableConfig, exclude_if=is_empty_val)
 

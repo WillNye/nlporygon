@@ -15,5 +15,6 @@ dependencies = [
     "pytz>=2025.2",
     "pyyaml>=6.0.3",
     "rbloom>=1.5.4",
+    "sqlalchemy>=2.0.46",
     "structlog>=25.5.0",
 ]

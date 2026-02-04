@@ -13,12 +13,12 @@ from typing import Optional
 
 import orjson
 from anthropic import AsyncAnthropic
+from pydantic import BaseModel
 from anthropic.types import TextBlockParam, CacheControlEphemeralParam, MessageParam
 
 from nlporygon.logger import logger
-from nlporygon.models import Config, Database
+from nlporygon.models import Config, Database, AgentConfig
 
-MODEL_VERSION = "claude-sonnet-4-5-20250929"
 # Prefix for intermediate queries where LLM requests data (e.g., enum values) before final SQL
 CONTEXT_FLAG = "INTERNAL_CONTEXT_QUERY"
 
@@ -36,6 +36,12 @@ def _sanitize_llm_response(response) -> str:
     return llm_response.rstrip('`')
 
 
+class AgentResponse(BaseModel):
+    user_prompt: str
+    llm_response: str
+    db_data: list[dict]
+
+
 @dataclasses.dataclass
 class DbAgent:
     """
@@ -48,12 +54,15 @@ class DbAgent:
     config: Config
     db: Database
     prompt_path: Optional[Path] = None
-    max_query_attempts: Optional[int] = 2
     _system_prompt: Optional[list[TextBlockParam]] = None
 
     def __post_init__(self):
         if self.prompt_path is None:
             self.prompt_path = self.config.prompt_path
+
+    @property
+    def agent_config(self) -> AgentConfig:
+        return self.config.agent_config
 
     @property
     def system_prompt(self) -> list[TextBlockParam]:
@@ -93,18 +102,19 @@ class DbAgent:
     ) -> str:
         message_history.append(MessageParam(role="user", content=user_message))
         response = await self.agent.messages.create(
-            model=MODEL_VERSION,
+            model=self.agent_config.model_version,
             system=self.system_prompt,  # Cached after first call
             messages=message_history,
-            max_tokens=2500,
-            temperature=0  # Deterministic output for consistent SQL generation
+            max_tokens=self.agent_config.max_tokens,
+            temperature=0,  # Deterministic output for consistent SQL generation
+            timeout=self.agent_config.timeout,
         )
         llm_response = _sanitize_llm_response(response)
 
         message_history.append(MessageParam(role="assistant", content=llm_response))
         return llm_response
 
-    async def query(self, message: str) -> list[dict]:
+    async def query(self, message: str) -> AgentResponse:
         """
         Converts natural language to SQL and executes it.
 
@@ -116,8 +126,9 @@ class DbAgent:
         current_attempt = 0
         message_history = []
         message_prefix = ""
+        response = AgentResponse(user_prompt=message, llm_response="", db_data=[])
 
-        while current_attempt < self.max_query_attempts:
+        while current_attempt < self.agent_config.max_query_attempts:
             context_queries = 0
             current_attempt += 1
             logger.debug("Sending query to LLM", attempt=current_attempt)
@@ -126,7 +137,7 @@ class DbAgent:
                 message_history
             )
 
-            while q_response.startswith(CONTEXT_FLAG) and context_queries < 3:
+            while q_response.startswith(CONTEXT_FLAG) and context_queries < self.agent_config.max_context_queries:
                 context_queries += 1
                 logger.debug("Processing context query", context_query_num=context_queries)
                 try:
@@ -153,15 +164,17 @@ class DbAgent:
                 db_data = await self.db.execute(q_response)
                 if db_data:
                     logger.info("Query successful", row_count=len(db_data))
-                    return db_data
+                    response.llm_response = q_response
+                    response.db_data = db_data
+                    return response
                 logger.debug("Query returned no data, retrying")
                 message_prefix = "The query didn't return any data. Look closely at the query and try again. "
             except Exception as e:
                 logger.warning("Query execution failed", attempt=current_attempt, error=str(e))
                 message_prefix = f"The query failed with the error: {e}. "
 
-        logger.warning("All query attempts exhausted", max_attempts=self.max_query_attempts)
-        return []
+        logger.warning("All query attempts exhausted", max_attempts=self.agent_config.max_query_attempts)
+        return response
 
 
 @dataclasses.dataclass
@@ -192,7 +205,6 @@ class MainAgent(DbAgent):
                 self.config,
                 self.db,
                 prompt_path,
-                self.max_query_attempts,
             )
             self._partition_agent_map[partition.name] = db_agent
 
@@ -231,11 +243,12 @@ class MainAgent(DbAgent):
         No explanation, just the partition name.""")
 
         response = await self.agent.messages.create(
-            model=MODEL_VERSION,
+            model=self.agent_config.model_version,
             system=system_prompt,
             messages=[MessageParam(role="user", content=message)],
             max_tokens=200,
-            temperature=0  # Deterministic routing
+            temperature=0,  # Deterministic routing
+            timeout=self.agent_config.timeout,
         )
         selected_partition = response.content[0].text.strip()
 
@@ -248,5 +261,4 @@ class MainAgent(DbAgent):
             if selected_partition.lower() in name.lower() or name.lower() in selected_partition.lower():
                 return name
 
-        # Last resort: return first partition
-        return list(self._partition_name_map.keys())[0]
+        raise ValueError(f"{selected_partition} is not a valid partition name")
