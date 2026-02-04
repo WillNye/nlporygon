@@ -75,7 +75,7 @@ def _get_prompt_prefix(db: Database) -> str:
     prompt_path = Path(__file__).parent / "data" / "sys_prompt_header.j2"
     prompt = prompt_path.read_text()
     return Template(prompt).render(
-        db_type=db.database_type.value,
+        db_type=db.database_type,
         db_version=db.database_version
     )
 
