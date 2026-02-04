@@ -1,3 +1,11 @@
+"""
+Discovers relationships between database columns using two approaches:
+
+1. Explicit foreign keys: Queries database metadata for declared FK constraints.
+2. Bloom filter heuristics: Detects implicit relationships where FKs aren't defined
+   by using bloom filters to efficiently test if one column's values are a subset
+   of another's (indicating a potential FK→PK relationship).
+"""
 from collections import defaultdict
 from textwrap import dedent
 from typing import Union
@@ -15,6 +23,10 @@ async def set_column_relationship(
     db: Database,
     tables: list[Table],
 ):
+    """
+    Populates column.relationships for all tables by querying explicit FK constraints
+    from the database, then runs bloom filter heuristics to detect implicit relationships.
+    """
     logger.info("Adding table definition foreign key relationships")
     results = await db.execute(
         get_query("get_fks.sql", db.database_type)
@@ -46,6 +58,12 @@ async def set_column_relationship(
 
 
 class ColumnBloom(BaseModel):
+    """
+    Wraps a column with its bloom filter and cardinality stats.
+
+    The total_count vs unique_value_count comparison identifies potential primary keys:
+    columns where every value is unique can be the "one" side of a one-to-many relationship.
+    """
     column: TableColumn
     bloom: Bloom
     sample_data: list
@@ -65,6 +83,10 @@ async def create_bloom_filter(
     table: Table,
     column: TableColumn,
 ) -> Union[ColumnBloom, None]:
+    """
+    Builds a ColumnBloom from distinct values in a column.
+    Returns None if the column is empty or contains unhashable types.
+    """
     limit = config.column_relationships.bloom_size
     bloom = Bloom(limit, config.column_relationships.error_rate)
     sample_data = []
@@ -119,6 +141,10 @@ async def create_column_bloom_map(
     db: Database,
     tables: list[Table],
 ) -> dict[str, dict[str, ColumnBloom]]:
+    """
+    Creates a ColumnBloom for every eligible column across all tables.
+    Skips types unsuitable for join relationships (dates, JSON, arrays, booleans, enums).
+    """
     response: dict[str, dict[str, ColumnBloom]] = {}
     logger.info("Creating bloom map for all columns across all tables")
 
@@ -165,6 +191,14 @@ async def bloom_filter_column_relationship(
     db: Database,
     tables: list[Table],
 ):
+    """
+    Detects implicit FK relationships using bloom filters.
+
+    For each column with 100% unique values (potential PK), checks if other columns'
+    values are subsets of it. Uses bloom filters for fast "definitely not present"
+    checks, then verifies bloom "maybe present" results with actual DB queries.
+    Relationships are added from the secondary (FK) column pointing to the primary (PK).
+    """
     column_bloom_map = await create_column_bloom_map(
         config,
         db,
@@ -187,6 +221,7 @@ async def bloom_filter_column_relationship(
 
         primary_bloom_map = column_bloom_map[primary_table.name]
         for p_col_bloom in primary_bloom_map.values():
+            # Only columns where every value is unique can be the "one" side of a relationship
             if p_col_bloom.total_count != p_col_bloom.unique_value_count:
                 # There's non-unique values so it's not a primary key
                 continue

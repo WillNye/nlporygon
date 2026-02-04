@@ -1,3 +1,10 @@
+"""
+Builds Table/TableColumn schema definitions by introspecting the database.
+
+Detects sub_data_type for columns storing serialized data (e.g., JSON strings that
+should be cast to arrays). Sets default ordering for tables based on date columns,
+primary keys, or ordinal position.
+"""
 import asyncio
 import datetime
 import decimal
@@ -39,6 +46,12 @@ async def generate_table_definitions(
     config: Config,
     db: Database,
 ) -> list[Table]:
+    """
+    Main entry point. Builds schema definitions for all accessible tables.
+
+    Loads existing schemas (removing stale tables no longer in DB), creates/updates
+    definitions with columns, relationships, and default ordering, then writes to YAML.
+    """
     schema_dir = config.schema_path
     table_data = await _get_tables(db)
     table_names = {get_table_name(r) for r in table_data}
@@ -81,6 +94,7 @@ async def generate_table_definitions(
 
 
 async def _get_tables(db: Database) -> list[dict]:
+    """Fetches table metadata, filtering out tables that can't be queried (permissions, etc.)."""
     get_tables = get_query("get_tables", db.database_type)
     response = []
     missing_tables = set()
@@ -106,6 +120,10 @@ async def upsert_basic_table_definition(
     table_data: list[dict],
     table_definition_map: dict[str, Table],
 ):
+    """
+    Creates or updates Table objects with columns from DB metadata.
+    Detects sub_data_type for columns that store serialized data.
+    """
     logger.info("Creating base definition for new tables")
     for column_dict in table_data:
         table_name = get_table_name(column_dict)
@@ -135,6 +153,10 @@ async def upsert_table_ordering(
     table_data: list[dict],
     table_definition_map: dict[str, Table],
 ):
+    """
+    Sets default_order for tables. Priority: date/datetime column (best for time-series),
+    then primary key columns, then first column as fallback.
+    """
     logger.info("Setting default query order for all tables")
     pk_results = await db.execute(
         get_query("get_pks.sql", db.database_type)
@@ -181,6 +203,13 @@ async def _set_sub_data_type(
     table: Table,
     column: TableColumn,
 ):
+    """
+    Samples column data to detect if the stored type differs from the declared type.
+
+    For example, a VARCHAR column storing "[1,2,3]" gets sub_data_type="INTEGER[]" so
+    the LLM knows to cast it. For JSON columns, recursively builds nested_columns to
+    expose the internal structure. Clears sub_data_type if values are inconsistent.
+    """
     def _upsert_nested_columns(_val: Union[dict, list], key: str):
         if isinstance(_val, list):
             if len(_val) > 0 and isinstance(_val[0], dict):
@@ -266,6 +295,7 @@ async def _set_sub_data_type(
 def _get_data_type(
     val: Any
 ) -> Union[str, None]:
+    """Infers SQL type from a Python value. Returns TYPE[] for lists, JSON for dicts."""
     if isinstance(val, list):
         inner_types = list({type(x) for x in val})
         if len(inner_types) != 1:
@@ -285,6 +315,3 @@ def _get_data_type(
         return "JSON"
     else:
         return None
-
-
-

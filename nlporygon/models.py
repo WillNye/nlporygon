@@ -1,3 +1,9 @@
+"""
+Core data models for nlporygon.
+
+Defines configuration, database abstractions, table/column schemas, and the
+alias mapping system used for prompt compression.
+"""
 import asyncio
 import json
 import re
@@ -15,6 +21,10 @@ def is_empty_val(value):
 
 
 class Database(BaseModel):
+    """
+    Abstract base for database connections. Subclass per database type (Postgres, Snowflake, etc.)
+    to implement database_type property and execute method.
+    """
     name: str
     database_version: str | None
     connection: Any
@@ -47,6 +57,10 @@ class ColumnConfig(BaseModel):
 
 
 class BaseTableRule(BaseModel):
+    """
+    Regex-based table filtering. Ignore rules take precedence over include rules.
+    If no include rules are specified, all tables are included by default.
+    """
     # Explicit rules where only tables that match at least 1 provided regex
     #   will be used for generating prompts
     include_table_rules: Optional[list[str]] = Field(default_factory=list, exclude_if=is_empty_val)
@@ -210,6 +224,10 @@ class Table(BaseModel):
 
 
 class SchemaAlias(BaseModel):
+    """
+    Bidirectional mappings between real names and compressed aliases.
+    Used to compress prompts (real→alias) and decode LLM output (alias→real).
+    """
     table_alias_map: dict[str, dict[str, str]]
     column_alias_map: dict[str, dict[str, str]]
     data_type_alias_map: dict[str, dict[str, str]]

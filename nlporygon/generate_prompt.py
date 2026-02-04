@@ -1,3 +1,10 @@
+"""
+Generates compressed schema prompts for LLMs.
+
+Replaces verbose table/column/type names with short aliases (t<A>, c<B>, d<C>) to
+reduce token count while preserving schema structure. Outputs a system prompt plus
+legend files that map aliases back to real names for post-processing LLM responses.
+"""
 from pathlib import Path
 
 import aiofiles
@@ -30,6 +37,10 @@ async def _generate_lookups(
     config: Config,
     tables: list[Table],
 ) -> SchemaAlias:
+    """
+    Builds bidirectional alias mappings for tables, columns, and data types.
+    Column aliases are globally unique across all tables to avoid ambiguity.
+    """
     table_alias_map = dict(to_alias=dict(), from_alias=dict())
     column_alias_map = dict(to_alias=dict(), from_alias=dict())
     data_type_alias_map = dict(to_alias=dict(), from_alias=dict())
@@ -70,6 +81,13 @@ def _get_prompt_prefix(db: Database) -> str:
 
 
 async def generate_prompts(config: Config, db: Database):
+    """
+    Main entry point. Generates compressed schema prompts for each partition.
+
+    If partitions are configured, creates separate prompts per partition (each with
+    its own tables plus any common tables). Otherwise creates a single "default" partition.
+    Outputs: sys_prompt.txt (compressed schema) and legend files for alias resolution.
+    """
     prompt_prefix = _get_prompt_prefix(db)
     tables = await Table.load_all(config.schema_path)
     tables = config.table_config.get_matching_tables(tables)
@@ -117,6 +135,10 @@ def _compress_schema(
     table: Table,
     table_names: set[str],
 ) -> str:
+    """
+    Converts a table definition to compressed format: t<A>(c<B> d<C>, c<D> d<E> REF[t<F>(c<G>)], ...)
+    Only includes relationships to tables within the current partition (table_names).
+    """
     table_name = schema_alias.get_table_alias(table.name)
     schema_str = f"{table_name}("
     for column in table.columns:
@@ -142,6 +164,7 @@ def _compress_schema(
 
 
 async def create_legends(path: Path, schema_alias: SchemaAlias):
+    """Writes legend files mapping aliases back to real names for post-processing LLM output."""
     legend = "Here is a legend of the Tables in the DB. The format is $alias->$properName where $alias is the prompt provided earlier\n"
     for name, alias in schema_alias.table_alias_map["to_alias"].items():
         legend += f"{alias}->{name}\n"
