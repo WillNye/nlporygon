@@ -203,4 +203,4 @@ class MainAgent(DbAgent):
                 return name
 
         # Last resort: return first partition
-        return list(self._partition_name_map.values())[0]
+        return list(self._partition_name_map.keys())[0]
