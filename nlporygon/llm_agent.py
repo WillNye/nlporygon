@@ -76,7 +76,8 @@ class DbAgent:
             model=MODEL_VERSION,
             system=self.system_prompt,  # Cached after first call
             messages=message_history,
-            max_tokens=5000
+            max_tokens=2500,
+            temperature=0  # Deterministic output for consistent SQL generation
         )
         llm_response = _sanitize_llm_response(response)
 
@@ -189,7 +190,8 @@ class MainAgent(DbAgent):
             model=MODEL_VERSION,
             system=system_prompt,
             messages=[MessageParam(role="user", content=message)],
-            max_tokens=200
+            max_tokens=200,
+            temperature=0  # Deterministic routing
         )
         selected_partition = response.content[0].text.strip()
 
