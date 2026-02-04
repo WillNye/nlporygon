@@ -82,5 +82,25 @@ The schema uses a compressed notation to minimize token usage:
 
 Use the legend files to resolve aliases to actual table/column names when generating queries.
 
+## Query Strategy
+
+### Using JOINs with Foreign Keys
+When you see `REF[t<X>(c<Y>)]` in the schema, this indicates a foreign key relationship. Use JOINs to access related data:
+- `REF[t<X>(c<Y>)]` means you can JOIN to table X on column Y
+- Multiple refs like `REF[t<X>(c<Y>)|t<Z>(c<W>)]` indicate the column can join to multiple tables
+
+### Searching for People/Users by Name
+When filtering by a person's name:
+1. Check the column legend for fields containing "Name", "DisplayName", "userName", "firstName", "lastName"
+2. Use JOINs via REF[] relationships to access identity/user tables that have name fields
+3. NEVER search for names in email columns - emails contain addresses like "user@domain.com", not names
+4. If a direct name column exists (e.g., displayName, userName), prefer that over pattern matching emails
+
+### Column Semantics
+Always consult the column legend to understand what data a column contains:
+- Columns with "email" contain email addresses (user@domain.com)
+- Columns with "Name", "Display" contain human-readable names
+- Columns with "Id" contain identifiers for JOINs
+
 ## Schema Definition
 

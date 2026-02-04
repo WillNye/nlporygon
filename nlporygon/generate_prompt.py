@@ -3,7 +3,7 @@ from pathlib import Path
 import aiofiles
 from jinja2 import Template
 
-from nlporygon.models import Config, Table, SchemaAlias, Database
+from nlporygon.models import Config, Table, SchemaAlias, Database, TablePartitionConfig
 
 
 def int_to_str(n: int) -> str:
@@ -70,19 +70,46 @@ def _get_prompt_prefix(db: Database) -> str:
 
 
 async def generate_prompts(config: Config, db: Database):
-    prompt = _get_prompt_prefix(db)
+    prompt_prefix = _get_prompt_prefix(db)
     tables = await Table.load_all(config.schema_path)
-    schema_alias = await _generate_lookups(config, tables)
-    table_names = {t.name for t in tables}
+    tables = config.table_config.get_matching_tables(tables)
 
-    for table in tables:
-        prompt = f"{prompt}\n{_compress_schema(schema_alias, table, table_names)}"
+    if config.table_config.partitions:
+        common_tables = []
+        if config.table_config.common_table:
+            common_tables = config.table_config.common_table.get_matching_tables(tables)
 
-    prompt_path = config.prompt_path / "sys_prompt.txt"
-    async with aiofiles.open(prompt_path, mode="w") as f:
-        await f.write(prompt)
+        partitions = []
+        for p in config.table_config.partitions:
+            p.tables = p.get_matching_tables(tables)
+            p.tables.extend(common_tables)
+            partitions.append(p)
 
-    await create_legends(config, schema_alias)
+    else:
+        partitions = [
+            TablePartitionConfig(
+                name="default",
+                description="Default partition.",
+                tables=tables,
+            )
+        ]
+
+    for p in partitions:
+        path = config.prompt_path / p.name
+        path.mkdir(parents=True, exist_ok=True)
+
+        schema_alias = await _generate_lookups(config, p.tables)
+        table_names = {t.name for t in p.tables}
+
+        prompt = prompt_prefix
+        for table in p.tables:
+            prompt = f"{prompt}\n{_compress_schema(schema_alias, table, table_names)}"
+
+        prompt_path = path / "sys_prompt.txt"
+        async with aiofiles.open(prompt_path, mode="w") as f:
+            await f.write(prompt)
+
+        await create_legends(path, schema_alias)
 
 
 def _compress_schema(
@@ -114,12 +141,12 @@ def _compress_schema(
     return schema_str
 
 
-async def create_legends(config: Config, schema_alias: SchemaAlias):
+async def create_legends(path: Path, schema_alias: SchemaAlias):
     legend = "Here is a legend of the Tables in the DB. The format is $alias->$properName where $alias is the prompt provided earlier\n"
     for name, alias in schema_alias.table_alias_map["to_alias"].items():
         legend += f"{alias}->{name}\n"
 
-    prompt_path = config.prompt_path / "table_legend.txt"
+    prompt_path = path / "table_legend.txt"
     async with aiofiles.open(prompt_path, mode="w") as f:
         await f.write(legend)
 
@@ -127,7 +154,7 @@ async def create_legends(config: Config, schema_alias: SchemaAlias):
     for name, alias in schema_alias.column_alias_map["to_alias"].items():
         legend += f"{alias}->{name}\n"
 
-    prompt_path = config.prompt_path / "column_legend.txt"
+    prompt_path = path / "column_legend.txt"
     async with aiofiles.open(prompt_path, mode="w") as f:
         await f.write(legend)
 
@@ -135,6 +162,6 @@ async def create_legends(config: Config, schema_alias: SchemaAlias):
     for name, alias in schema_alias.data_type_alias_map["to_alias"].items():
         legend += f"{alias}->{name}\n"
 
-    prompt_path = config.prompt_path / "data_type_legend.txt"
+    prompt_path = path / "data_type_legend.txt"
     async with aiofiles.open(prompt_path, mode="w") as f:
         await f.write(legend)

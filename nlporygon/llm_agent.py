@@ -1,6 +1,8 @@
 import dataclasses
 import re
-from typing import Optional, Tuple
+from pathlib import Path
+from textwrap import dedent
+from typing import Optional
 
 import orjson
 from anthropic import AsyncAnthropic
@@ -29,19 +31,38 @@ class DbAgent:
     agent: AsyncAnthropic
     config: Config
     db: Database
-    max_query_attempts: Optional[int] = 3
+    prompt_path: Optional[Path] = None
+    max_query_attempts: Optional[int] = 2
     _system_prompt: Optional[list[TextBlockParam]] = None
+
+    def __post_init__(self):
+        if self.prompt_path is None:
+            self.prompt_path = self.config.prompt_path
 
     @property
     def system_prompt(self) -> list[TextBlockParam]:
         if self._system_prompt:
             return self._system_prompt
 
+        # Load files in specific order: sys_prompt first, then legends
+        # This ensures the LLM sees instructions before the alias mappings
+        prompt_files = []
+        sys_prompt_file = self.prompt_path / "sys_prompt.txt"
+        if sys_prompt_file.exists():
+            prompt_files.append(sys_prompt_file)
+
+        # Add legend files in consistent order
+        for legend_name in ["table_legend.txt", "column_legend.txt", "data_type_legend.txt"]:
+            legend_file = self.prompt_path / legend_name
+            if legend_file.exists():
+                prompt_files.append(legend_file)
+
         prompts: list[TextBlockParam] = []
-        for path in self.config.prompt_path.iterdir():
+        for path in prompt_files:
             prompts.append(TextBlockParam(type="text", text=path.read_text()))
 
-        prompts[-1]["cache_control"] = CacheControlEphemeralParam(type="ephemeral", ttl='1h')
+        if prompts:
+            prompts[-1]["cache_control"] = CacheControlEphemeralParam(type="ephemeral", ttl='1h')
         self._system_prompt = prompts
         return self._system_prompt
 
@@ -75,13 +96,17 @@ class DbAgent:
                 message_history
             )
 
-            while q_response.startswith(CONTEXT_FLAG) and context_queries < 5:
+            while q_response.startswith(CONTEXT_FLAG) and context_queries < 3:
                 context_queries += 1
                 try:
-                    q_response = q_response.replace(CONTEXT_FLAG, "")
-                    db_data = await self.db.execute(q_response)
+                    db_data = await self.db.execute(q_response.replace(CONTEXT_FLAG, ""))
+                    if db_data:
+                        msg = orjson.dumps(db_data).decode()
+                    else:
+                        msg = "The query didn't return any data."
+
                     q_response = await self._send_message(
-                        orjson.dumps(db_data).decode(),
+                        msg,
                         message_history
                     )
                 except Exception as e:
@@ -102,3 +127,80 @@ class DbAgent:
         return []
 
 
+@dataclasses.dataclass
+class MainAgent(DbAgent):
+    _partition_agent_map: Optional[dict] = None
+    _partition_name_map: Optional[dict] = None
+
+    @property
+    def partition_agent_map(self) -> dict:
+        if self._partition_agent_map:
+            return self._partition_agent_map
+
+        self._partition_agent_map = {}
+        self._partition_name_map = {}
+
+        for partition in self.config.table_config.partitions:
+            self._partition_name_map[partition.name] = partition.description
+
+            prompt_path = self.prompt_path / partition.name
+            db_agent = DbAgent(
+                AsyncAnthropic(),
+                self.config,
+                self.db,
+                prompt_path,
+                self.max_query_attempts,
+            )
+            self._partition_agent_map[partition.name] = db_agent
+
+        return self._partition_agent_map
+
+    @property
+    def partition_name_map(self) -> dict:
+        return self._partition_name_map
+
+    async def query(self, message: str) -> list[dict]:
+        partition_agent_map = self.partition_agent_map
+        if len(partition_agent_map) == 1:
+            agent = list(partition_agent_map.values())[0]
+        else:
+            partition_name = await self._select_partition(message)
+            agent = partition_agent_map[partition_name]
+
+        return await agent.query(message)
+
+    async def _select_partition(self, message: str) -> str:
+        """Use LLM to select the best partition for the given query."""
+        system_prompt = dedent("""You are a database query router. 
+        Given a user's natural language query, determine which database partition is most relevant.
+        
+        Partition Format
+        - Name : Description
+        
+        Available partitions:
+        """)
+        for desc, name in self.partition_name_map.items():
+            system_prompt += f"- {name} : {desc}\n"
+
+        system_prompt += dedent("""Respond with ONLY the exact partition name that best matches the query. 
+        No explanation, just the partition name.""")
+
+        response = await self.agent.messages.create(
+            model=MODEL_VERSION,
+            system=system_prompt,
+            messages=[MessageParam(role="user", content=message)],
+            max_tokens=200
+        )
+        selected_partition = response.content[0].text.strip()
+
+        # Find best matching description (exact match or closest)
+        if selected_partition in self.partition_name_map:
+            return selected_partition
+
+        # Fallback: find description that contains the response or vice versa
+        for name in self.partition_name_map.keys():
+            if selected_partition.lower() in name.lower() or name.lower() in selected_partition.lower():
+                return name
+
+        # Last resort: return first partition
+        return list(self._partition_name_map.values())[0]

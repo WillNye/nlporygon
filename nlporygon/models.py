@@ -56,10 +56,11 @@ class BaseTableRule(BaseModel):
     #   if they match one of these.
     ignore_table_rules: Optional[list[str]] = Field(default_factory=list, exclude_if=is_empty_val)
 
-    def get_matching_tables(self, tables: list[str]):
-        def _is_match(_t) -> bool:
+    def get_matching_tables(self, tables: list["Table"]):
+        def _is_match(_t: Table) -> bool:
+            name = _t.name.replace('"', '')
             if any(
-                re.match(r, _t, flags=re.IGNORECASE)
+                re.match(r, name, flags=re.IGNORECASE)
                 for r in self.ignore_table_rules
             ):
                 return False
@@ -69,7 +70,7 @@ class BaseTableRule(BaseModel):
                 return True
 
             return any(
-                re.match(r, _t, flags=re.IGNORECASE)
+                re.match(r, name, flags=re.IGNORECASE)
                 for r in self.include_table_rules
             )
 
@@ -79,6 +80,7 @@ class BaseTableRule(BaseModel):
 class TablePartitionConfig(BaseTableRule):
     name: str
     description: str
+    tables: Optional[list["Table"]] = Field(default_factory=list, exclude_if=is_empty_val)
 
 
 class CommonTableRule(BaseTableRule):
@@ -86,7 +88,7 @@ class CommonTableRule(BaseTableRule):
 
 
 class TableConfig(BaseTableRule):
-    common_tables: Optional[CommonTableRule] = Field(default_factory=CommonTableRule, exclude_if=is_empty_val)
+    common_table: Optional[CommonTableRule] = Field(default=None)
     partitions: Optional[list[TablePartitionConfig]] = Field(default_factory=list, exclude_if=is_empty_val)
 
 

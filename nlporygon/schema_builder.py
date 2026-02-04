@@ -36,8 +36,8 @@ PYTHON_TO_SQL_TYPE_MAP = {
 
 
 async def generate_table_definitions(
-    db: Database,
     config: Config,
+    db: Database,
 ) -> list[Table]:
     schema_dir = config.schema_path
     table_data = await _get_tables(db)
