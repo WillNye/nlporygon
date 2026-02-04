@@ -4,8 +4,6 @@ from typing import Any, Optional
 
 from jinja2 import Template
 
-from nlporygon import SupportedDbType
-
 QUERY_DIR = Path(__file__).parent / "queries"
 
 
@@ -24,17 +22,17 @@ def _get_query(
 
 def get_query(
     query_name: str,
-    db_type: SupportedDbType
+    db_type: str
 ) -> str:
-    return _get_query(query_name, db_type.value)
+    return _get_query(query_name, db_type)
 
 
 def get_query_template(
     query_name: str,
-    db_type: SupportedDbType
+    db_type: str
 ):
     return Template(
-        _get_query(query_name, db_type.value)
+        _get_query(query_name, db_type)
     )
 
 

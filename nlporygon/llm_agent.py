@@ -214,7 +214,7 @@ class MainAgent(DbAgent):
     def partition_name_map(self) -> dict:
         return self._partition_name_map
 
-    async def query(self, message: str) -> list[dict]:
+    async def query(self, message: str) -> AgentResponse:
         partition_agent_map = self.partition_agent_map
         if len(partition_agent_map) == 1:
             agent = list(partition_agent_map.values())[0]

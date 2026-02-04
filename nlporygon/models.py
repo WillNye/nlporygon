@@ -13,8 +13,9 @@ from typing import Callable, Optional, Any, Union
 import aiofiles
 import yaml
 from pydantic import BaseModel, Field
-
-from nlporygon import SupportedDbType
+from sqlalchemy import text
+from sqlalchemy.engine.base import Engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 def is_empty_val(value):
     return not value
@@ -22,25 +23,53 @@ def is_empty_val(value):
 
 class Database(BaseModel):
     """
-    Abstract base for database connections. Subclass per database type (Postgres, Snowflake, etc.)
-    to implement database_type property and execute method.
+    Database connection wrapper using SQLAlchemy async engine.
+    Supports any SQLAlchemy-compatible backend (PostgreSQL, SQLite, DuckDB, Snowflake, etc.)
     """
     name: str
-    database_version: str | None
-    connection: Any
+    database_type: str
+    database_version: str | None = None
+    connection: Union[AsyncEngine, Engine]
     timeout: Optional[int] = 30
 
-    @property
-    def database_type(self) -> SupportedDbType:
-        raise NotImplementedError
+    model_config = {"arbitrary_types_allowed": True}
 
     async def execute(
         self,
         query: str,
         query_params: Optional[dict] = None,
         **kwargs
-    ) -> list[dict] | None:
-        raise NotImplementedError
+    ) -> list[dict]:
+        """
+        Executes a SQL query and returns results as a list of dictionaries.
+
+        Args:
+            query: SQL query string. Use :param_name for parameter binding.
+            query_params: Optional dict of parameter values.
+
+        Returns:
+            List of dicts, one per row, with column names as keys.
+        """
+        if isinstance(self.connection, Engine):
+            with self.connection.connect() as conn:
+                result = conn.execute(
+                    text(query),
+                    query_params or {}
+                )
+                rows = result.fetchall()
+        else:
+            async with self.connection.connect() as conn:
+                result = await conn.execute(
+                    text(query),
+                    query_params or {}
+                )
+                rows = result.fetchall()
+
+        if not result.keys():
+            return []
+
+        column_names = list(result.keys())
+        return [dict(zip(column_names, row)) for row in rows]
 
 
 class ColumnConfig(BaseModel):
@@ -112,7 +141,7 @@ class AgentConfig(BaseModel):
     max_tokens: Optional[int] = 2500
     max_query_attempts: Optional[int] = 2
     max_context_queries: Optional[int] = 3
-    timeout: Optional[int] = 10
+    timeout: Optional[int] = 60
 
 
 class Config(BaseModel):
@@ -139,30 +168,6 @@ class Config(BaseModel):
             self.output_path = Path(self.output_path)
 
         return super().model_post_init(context)
-
-
-class Cache(BaseModel):
-    name: str
-    connection_info: dict
-    connection_class: Callable
-    _connection: Callable | None = None
-
-    def _connect(self):
-        self._connection = self.connection_class(**self.connection_info)
-
-    @property
-    def connection(self) -> Callable:
-        if not self._connection:
-            self._connect()
-        return self._connection
-
-    async def execute(
-        self,
-        query: str,
-        query_params: Optional[dict] = None,
-        **kwargs
-    ) -> list[dict] | None:
-        raise NotImplementedError
 
 
 class ColumnRelationship(BaseModel):

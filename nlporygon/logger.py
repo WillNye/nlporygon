@@ -7,9 +7,13 @@ import orjson
 import structlog
 
 
+def _serialize(msg: dict, **kwargs) -> str:
+    return orjson.dumps(msg, **kwargs).decode("utf8")
+
+
 def configure_logger(logger_name, log_level):
     if not structlog.is_configured():
-        renderer = structlog.processors.JSONRenderer(serializer=orjson.dumps)
+        renderer = structlog.processors.JSONRenderer(serializer=_serialize)
         structlog.configure(
             processors=[
                 structlog.processors.add_log_level,
