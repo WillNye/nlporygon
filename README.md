@@ -79,22 +79,21 @@ uv add nlporygon
 
 ```python
 import asyncio
-import duckdb
 from anthropic import AsyncAnthropic
 from pathlib import Path
+from sqlalchemy import create_engine
 
-from nlporygon.database import DuckDb
-from nlporygon.models import Config
+from nlporygon.models import Config, Database
 from nlporygon.schema_builder import generate_table_definitions
 from nlporygon.generate_prompt import generate_prompts
 from nlporygon.llm_agent import MainAgent
 
 async def main():
-    # 1. Connect to your database
-    db = DuckDb(
+    # 1. Connect to your database (any SQLAlchemy-supported backend)
+    db = Database(
         name="analytics",
-        database_version="1.4.3",
-        connection=duckdb.connect("path/to/database.db", read_only=True)
+        database_type="duckdb",
+        connection=create_engine("duckdb:///path/to/database.db")
     )
 
     # 2. Configure nlporygon
@@ -108,8 +107,10 @@ async def main():
 
     # 5. Query with natural language
     agent = MainAgent(AsyncAnthropic(), config, db)
-    results = await agent.query("What are the top 10 customers by total order value?")
-    print(results)
+    result = await agent.query("What are the top 10 customers by total order value?")
+
+    print(f"Generated SQL: {result.llm_response}")
+    print(f"Results: {result.db_data}")
 
 asyncio.run(main())
 ```
@@ -124,16 +125,15 @@ Table definitions capture your schema structure—tables, columns, data types, a
 
 ```python
 from pathlib import Path
-from nlporygon.database import DuckDb
-from nlporygon.models import Config, ColumnConfig, TableConfig
+from sqlalchemy import create_engine
+from nlporygon.models import Config, Database, ColumnConfig, TableConfig
 from nlporygon.schema_builder import generate_table_definitions
-import duckdb
 
-# Connect to your database
-db = DuckDb(
+# Connect to your database (any SQLAlchemy-supported backend)
+db = Database(
     name="analytics",
-    database_version="1.4.3",
-    connection=duckdb.connect("/path/to/analytics.db", read_only=True)
+    database_type="duckdb",
+    connection=create_engine("duckdb:///path/to/analytics.db")
 )
 
 # Configure output and filtering
@@ -226,7 +226,7 @@ Where:
 
 ### Step 3: Query with the Agent
 
-Use the `MainAgent` to convert natural language to SQL and execute queries.
+Use the `MainAgent` to convert natural language to SQL and execute queries. The agent returns an `AgentResponse` object containing the generated SQL and query results.
 
 ```python
 from anthropic import AsyncAnthropic
@@ -239,14 +239,17 @@ agent = MainAgent(
 )
 
 # Ask questions in natural language
-results = await agent.query("How many orders were placed last month?")
-print(results)  # [{"count": 1523}]
+result = await agent.query("How many orders were placed last month?")
+print(result.llm_response)  # SELECT COUNT(*) FROM orders WHERE ...
+print(result.db_data)       # [{"count": 1523}]
 
-results = await agent.query("What are the top 5 products by revenue?")
-print(results)  # [{"product_name": "...", "revenue": ...}, ...]
+result = await agent.query("What are the top 5 products by revenue?")
+print(result.db_data)  # [{"product_name": "...", "revenue": ...}, ...]
 
-results = await agent.query("Show me all customers who signed up this week")
-print(results)
+# Access the generated SQL for debugging or logging
+result = await agent.query("Show me all customers who signed up this week")
+print(f"Generated SQL:\n{result.llm_response}")
+print(f"Found {len(result.db_data)} customers")
 ```
 
 ---
@@ -258,17 +261,45 @@ print(results)
 The main configuration object.
 
 ```python
-from nlporygon.models import Config, ColumnConfig, TableConfig
+from nlporygon.models import Config, ColumnConfig, TableConfig, AgentConfig
 
 config = Config(
     # Required: where to store schema and prompt files
     output_path=Path("./output"),
+
+    # Optional: LLM agent settings
+    agent_config=AgentConfig(...),
 
     # Optional: column relationship detection settings
     column_relationships=ColumnConfig(...),
 
     # Optional: table filtering and partitioning
     table_config=TableConfig(...),
+)
+```
+
+### AgentConfig
+
+Controls LLM behavior and query execution.
+
+```python
+from nlporygon.models import AgentConfig
+
+agent_config = AgentConfig(
+    # Claude model version (default: claude-sonnet-4-5-20250929)
+    model_version="claude-sonnet-4-5-20250929",
+
+    # Max tokens for LLM response (default: 2500)
+    max_tokens=2500,
+
+    # Number of retry attempts on query failure (default: 2)
+    max_query_attempts=2,
+
+    # Max context queries per attempt (default: 3)
+    max_context_queries=3,
+
+    # LLM API timeout in seconds (default: 60)
+    timeout=60,
 )
 ```
 
@@ -346,12 +377,37 @@ The LLM then makes a decision which partition is the best fit based on this info
 
 ## Supported Databases
 
-| Database | Status | Import |
-|----------|--------|--------|
-| DuckDB   | ✅ Supported | `from nlporygon.database import DuckDb` |
-| PostgreSQL | 🔜 Coming soon | — |
-| Snowflake | 🔜 Coming soon | — |
+nlporygon uses SQLAlchemy, so any SQLAlchemy-compatible database works out of the box.
 
+| Database | Connection String Example |
+|----------|---------------------------|
+| DuckDB | `duckdb:///path/to/database.db` |
+| PostgreSQL | `postgresql://user:pass@host:5432/dbname` |
+| PostgreSQL (async) | `postgresql+asyncpg://user:pass@host:5432/dbname` |
+| MySQL | `mysql+pymysql://user:pass@host:3306/dbname` |
+| SQLite | `sqlite:///path/to/database.db` |
+| Snowflake | `snowflake://user:pass@account/database/schema` |
+| BigQuery | `bigquery://project/dataset` |
+
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.ext.asyncio import create_async_engine
+from nlporygon.models import Database
+
+# Sync engine (most databases)
+db = Database(
+    name="mydb",
+    database_type="postgresql",
+    connection=create_engine("postgresql://user:pass@localhost/mydb")
+)
+
+# Async engine (for high-concurrency applications)
+db = Database(
+    name="mydb",
+    database_type="postgresql",
+    connection=create_async_engine("postgresql+asyncpg://user:pass@localhost/mydb")
+)
+```
 
 ## Supported LLMs
 
