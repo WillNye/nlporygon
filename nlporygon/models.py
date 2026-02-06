@@ -42,6 +42,7 @@ class Database(BaseModel):
         self,
         query: str,
         query_params: Optional[dict] = None,
+        commit: bool = False,
         **kwargs
     ) -> list[dict]:
         """
@@ -50,6 +51,7 @@ class Database(BaseModel):
         Args:
             query: SQL query string. Use :param_name for parameter binding.
             query_params: Optional dict of parameter values.
+            commit: Call commit after executing the query.
 
         Returns:
             List of dicts, one per row, with column names as keys.
@@ -61,6 +63,8 @@ class Database(BaseModel):
                     query_params or {}
                 )
                 rows = result.fetchall()
+                if commit:
+                    await conn.commit()
         else:
             with self.connection.connect() as conn:
                 result = conn.execute(
@@ -68,6 +72,8 @@ class Database(BaseModel):
                     query_params or {}
                 )
                 rows = result.fetchall()
+                if commit:
+                    conn.commit()
 
         if not result.keys():
             return []

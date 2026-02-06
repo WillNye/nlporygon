@@ -23,9 +23,74 @@ from nlporygon.query_store import QueryStore
 # Prefix for intermediate queries where LLM requests data (e.g., enum values) before final SQL
 CONTEXT_FLAG = "INTERNAL_CONTEXT_QUERY"
 
+# Pre-compiled forbidden SQL patterns for efficient validation
+# Each tuple: (compiled_pattern, human_readable_name)
+_FORBIDDEN_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # DDL statements
+    (re.compile(r'\b(CREATE|ALTER|DROP)\s+(TABLE|INDEX|VIEW|DATABASE|SCHEMA|FUNCTION|PROCEDURE|TRIGGER)\b', re.IGNORECASE), 'DDL statement'),
+    (re.compile(r'\bTRUNCATE\s+TABLE\b', re.IGNORECASE), 'TRUNCATE statement'),
+
+    # DML statements (non-SELECT)
+    (re.compile(r'\bINSERT\s+INTO\b', re.IGNORECASE), 'INSERT statement'),
+    (re.compile(r'\bUPDATE\s+\w+\s+SET\b', re.IGNORECASE), 'UPDATE statement'),
+    (re.compile(r'\bDELETE\s+FROM\b', re.IGNORECASE), 'DELETE statement'),
+    (re.compile(r'\bMERGE\s+INTO\b', re.IGNORECASE), 'MERGE statement'),
+
+    # Permission/access control
+    (re.compile(r'\b(GRANT|REVOKE)\b', re.IGNORECASE), 'Permission statement'),
+
+    # Transaction control
+    (re.compile(r'\b(COMMIT|ROLLBACK)\b', re.IGNORECASE), 'Transaction control'),
+
+    # Dangerous functions/commands
+    (re.compile(r'\bEXEC(UTE)?\s*\(', re.IGNORECASE), 'EXECUTE statement'),
+    (re.compile(r'\b(XP_|SP_|DBMS_|UTL_)\w+', re.IGNORECASE), 'Stored procedure'),
+    (re.compile(r'\bLOAD\s+DATA\b', re.IGNORECASE), 'LOAD DATA statement'),
+    (re.compile(r'\bINTO\s+(OUTFILE|DUMPFILE)\b', re.IGNORECASE), 'File output clause'),
+
+    # SQL injection patterns
+    (re.compile(r';\s*(SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE)', re.IGNORECASE), 'Multiple statements'),
+    (re.compile(r'--\s*$', re.IGNORECASE), 'SQL comment injection'),
+    (re.compile(r'/\*.*\*/', re.IGNORECASE), 'Block comment injection'),
+    (re.compile(r'\bUNION\s+ALL\s+SELECT\s+NULL', re.IGNORECASE), 'UNION NULL injection'),
+    (re.compile(r"'\s*OR\s+'?1'?\s*=\s*'?1|OR\s+'1'\s*=\s*'1'", re.IGNORECASE), 'OR 1=1 injection'),
+    (re.compile(r'\bSLEEP\s*\(\d+\)', re.IGNORECASE), 'SLEEP timing attack'),
+    (re.compile(r'\bBENCHMARK\s*\(', re.IGNORECASE), 'BENCHMARK timing attack'),
+    (re.compile(r'\bWAITFOR\s+DELAY\b', re.IGNORECASE), 'WAITFOR timing attack'),
+
+    # File system access
+    (re.compile(r'\b(READ_FILE|WRITE_FILE|LOAD_FILE)\s*\(', re.IGNORECASE), 'File access function'),
+]
+
+
+class UnsafeSQLError(Exception):
+    """Raised when LLM generates SQL that contains forbidden/dangerous patterns."""
+
+    def __init__(self, message: str, pattern_name: str, sql: str):
+        self.pattern_name = pattern_name
+        self.sql = sql
+        super().__init__(message)
+
+
+def _validate_sql_safety(sql: str) -> None:
+    """
+    Check SQL for dangerous patterns and raise UnsafeSQLError if found.
+
+    Uses pre-compiled regex patterns for efficiency. This is a defense-in-depth
+    measure - the LLM should only generate SELECT statements, but this catches
+    any attempts at DDL, DML, or injection.
+    """
+    for pattern, name in _FORBIDDEN_PATTERNS:
+        if pattern.search(sql):
+            raise UnsafeSQLError(
+                f"Unsafe SQL detected: {name}",
+                pattern_name=name,
+                sql=sql
+            )
+
 
 def _sanitize_llm_response(response) -> str:
-    """Extracts SQL or context query from LLM response, stripping markdown artifacts."""
+    """Extracts SQL from LLM response, stripping markdown artifacts and outer LIMIT/OFFSET."""
     llm_response = response.content[0].text
     if CONTEXT_FLAG in llm_response:
         llm_response = re.split(CONTEXT_FLAG, llm_response, flags=re.IGNORECASE)[-1]
@@ -34,7 +99,27 @@ def _sanitize_llm_response(response) -> str:
         llm_response = re.split(r'SELECT', llm_response, flags=re.IGNORECASE)[-1]
         llm_response = f"SELECT{llm_response}"
 
-    return llm_response.rstrip('`')
+    llm_response = llm_response.rstrip('`')
+
+    # Remove only outer LIMIT and OFFSET (at end of query, preserves subqueries)
+    llm_response = re.sub(r'\s+LIMIT\s+\d+\s+OFFSET\s+\d+\s*$', '', llm_response, flags=re.IGNORECASE)
+    llm_response = re.sub(r'\s+LIMIT\s+\d+\s*$', '', llm_response, flags=re.IGNORECASE)
+    llm_response = re.sub(r'\s+OFFSET\s+\d+\s*$', '', llm_response, flags=re.IGNORECASE)
+
+    llm_response = llm_response.strip()
+
+    # Validate SQL is safe before returning
+    _validate_sql_safety(llm_response)
+
+    return llm_response
+
+
+def _set_query_limit_offset(
+    query: str,
+    limit: int,
+    offset: Optional[int] = 0,
+) -> str:
+    return f"{query}\nLIMIT\n{limit}\nOFFSET {offset}"
 
 
 class AgentResponse(BaseModel):
@@ -110,12 +195,20 @@ class DbAgent:
             temperature=0,  # Deterministic output for consistent SQL generation
             timeout=self.agent_config.timeout,
         )
-        llm_response = _sanitize_llm_response(response)
+        try:
+            llm_response = _sanitize_llm_response(response)
+            message_history.append(MessageParam(role="assistant", content=llm_response))
+        except UnsafeSQLError:
+            raise
 
-        message_history.append(MessageParam(role="assistant", content=llm_response))
         return llm_response
 
-    async def query(self, message: str) -> AgentResponse:
+    async def query(
+        self,
+        message: str,
+        limit: int,
+        offset: int
+    ) -> AgentResponse:
         """
         Converts natural language to SQL and executes it.
 
@@ -133,16 +226,26 @@ class DbAgent:
             context_queries = 0
             current_attempt += 1
             logger.debug("Sending query to LLM", attempt=current_attempt)
-            q_response = await self._send_message(
-                f"{message_prefix}{message}",
-                message_history
-            )
+
+            try:
+                q_response = await self._send_message(
+                    f"{message_prefix}{message}",
+                    message_history
+                )
+            except UnsafeSQLError as e:
+                message_prefix = f"The query you wrote is unsafe: {e}. "
+                continue
 
             while q_response.startswith(CONTEXT_FLAG) and context_queries < self.agent_config.max_context_queries:
                 context_queries += 1
                 logger.debug("Processing context query", context_query_num=context_queries)
                 try:
-                    db_data = await self.db.execute(q_response.replace(CONTEXT_FLAG, ""))
+                    db_data = await self.db.execute(
+                        _set_query_limit_offset(
+                            q_response.replace(CONTEXT_FLAG, ""),
+                            1000
+                        )
+                    )
                     if db_data:
                         msg = orjson.dumps(db_data).decode()
                     else:
@@ -152,6 +255,10 @@ class DbAgent:
                         msg,
                         message_history
                     )
+                except UnsafeSQLError as e:
+                    message_prefix = f"The query you wrote is unsafe: {e}. "
+                    q_response = None
+                    break
                 except Exception as e:
                     logger.warning("Context query failed", error=str(e))
                     q_response = await self._send_message(
@@ -160,9 +267,14 @@ class DbAgent:
                     )
                     break
 
+            if not q_response:
+                continue
+
             try:
                 logger.debug("Executing generated SQL", query=q_response)
-                db_data = await self.db.execute(q_response)
+                db_data = await self.db.execute(
+                    _set_query_limit_offset(q_response, limit, offset)
+                )
                 if db_data:
                     logger.info("Query successful", row_count=len(db_data))
                     response.llm_response = q_response
@@ -219,14 +331,14 @@ class MainAgent(DbAgent):
     def partition_name_map(self) -> dict:
         return self._partition_name_map
 
-    async def query(self, message: str) -> AgentResponse:
+    async def query(self, message: str, limit: int, offset: int) -> AgentResponse:
         # Check saved queries first (if query_store is configured)
         if self.query_store:
             cached = await self.query_store.lookup(message)
             if cached:
                 logger.info("Using cached query", similarity_match=cached.user_message[:50])
                 try:
-                    db_data = await self.db.execute(cached.query)
+                    db_data = await self.db.execute(_set_query_limit_offset(cached.query, limit, offset))
                     return AgentResponse(
                         user_prompt=message,
                         llm_response=cached.query,
@@ -245,11 +357,12 @@ class MainAgent(DbAgent):
             logger.info("Routed query to partition", partition=partition_name)
             agent = partition_agent_map[partition_name]
 
-        response = await agent.query(message)
+        response = await agent.query(message, limit, offset)
         if self.query_store and response.db_data:
             await self.query_store.save(
                 message,
                 response.llm_response,
+                False
             )
 
         return response
