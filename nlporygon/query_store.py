@@ -6,15 +6,17 @@ Uses sentence-transformers for embedding generation and FAISS for
 efficient in-memory similarity search at scale (100k+ queries).
 """
 from datetime import datetime
+from textwrap import dedent
 from typing import Optional
+from uuid import UUID, uuid4
 
 import faiss
 import numpy as np
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
-from sqlalchemy import Column, Integer, String, Text, DateTime, JSON, text
+from sqlalchemy import Column, String, Text, DateTime, JSON, Uuid
 from sqlalchemy.orm import declarative_base
-from sqlalchemy.sql.sqltypes import Boolean
+from sqlalchemy.sql.sqltypes import Boolean, Integer
 
 from nlporygon.logger import logger
 from nlporygon.models import Database
@@ -24,14 +26,14 @@ Base = declarative_base()
 
 class SavedQueryModel(Base):
     """SQLAlchemy model for persisted queries."""
-    __tablename__ = "saved_queries"
+    __tablename__ = "nlporygon__saved_queries"
 
-    id = Column(Integer, primary_key=True)
+    id = Column(Uuid, primary_key=True, default=uuid4)
     prompt_version = Column(String(255), nullable=False, index=True)
     user_message = Column(Text, nullable=False)
     query = Column(Text, nullable=False)
     embedding = Column(JSON, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.now)
     last_used_at = Column(DateTime, nullable=True)
     use_count = Column(Integer, default=0)
     internal = Column(Boolean, nullable=False, default=False)
@@ -39,7 +41,7 @@ class SavedQueryModel(Base):
 
 class SavedQuery(BaseModel):
     """Pydantic model for API responses."""
-    id: int
+    id: UUID
     prompt_version: str
     user_message: str
     query: str
@@ -89,7 +91,7 @@ class QueryStore:
 
         # FAISS index state
         self._index: Optional[faiss.IndexFlatIP] = None
-        self._index_id_map: dict[int, int] = {}  # faiss_idx -> db_id
+        self._index_id_map: dict[int, UUID] = {}  # faiss_idx -> db_id
 
     @property
     def model(self) -> SentenceTransformer:
@@ -134,12 +136,12 @@ class QueryStore:
 
         logger.info("Built FAISS index", num_vectors=len(saved), prompt_version=self.prompt_version)
 
-    async def _fetch_by_id(self, query_id: int) -> Optional[SavedQuery]:
+    async def _fetch_by_id(self, query_id: UUID) -> Optional[SavedQuery]:
         """Fetch a single saved query by ID."""
-        sql = text("""
+        sql = dedent("""
             SELECT id, prompt_version, user_message, query, embedding,
                    created_at, last_used_at, use_count
-            FROM saved_queries
+            FROM nlporygon__saved_queries
             WHERE id = :id
         """)
 
@@ -150,7 +152,8 @@ class QueryStore:
         return None
 
     async def create_tables(self) -> None:
-        """Create the saved_queries table if it doesn't exist."""
+        """Create the nlporygon__saved_queries table if it doesn't exist."""
+
         if self.db.is_async:
             async with self.db.connection.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
@@ -160,10 +163,10 @@ class QueryStore:
 
     async def _fetch_queries_for_version(self) -> list[SavedQuery]:
         """Fetch all saved queries for a given prompt version."""
-        query = text("""
+        query = dedent("""
             SELECT id, prompt_version, user_message, query, embedding,
                    created_at, last_used_at, use_count
-            FROM saved_queries
+            FROM nlporygon__saved_queries
             WHERE prompt_version = :version
         """)
 
@@ -174,20 +177,15 @@ class QueryStore:
             for r in result
         ]
 
-    async def _update_usage(self, query_id: int) -> None:
+    async def _update_usage(self, query_id: UUID) -> None:
         """Update last_used_at and increment use_count for a query."""
-        query = text("""
-            UPDATE saved_queries
+        query = dedent("""
+            UPDATE nlporygon__saved_queries
             SET last_used_at = :now, use_count = use_count + 1
             WHERE id = :id
         """)
 
-        if self.db.is_async:
-            async with self.db.connection.begin() as conn:
-                await conn.execute(query, {"now": datetime.utcnow(), "id": query_id})
-        else:
-            with self.db.connection.begin() as conn:
-                conn.execute(query, {"now": datetime.utcnow(), "id": query_id})
+        await self.db.execute(query, {"now": datetime.utcnow(), "id": query_id}, commit=True)
 
     async def prune_table(self):
         # Remove queries not being used
@@ -212,7 +210,7 @@ class QueryStore:
         """
         # Rebuild index if prompt version changed or not initialized
         if self._index is None:
-            await self._build_index(self.prompt_version)
+            await self._build_index()
 
         if self._index.ntotal == 0:
             return None
@@ -246,7 +244,8 @@ class QueryStore:
     async def save(
         self,
         user_message: str,
-        query: str
+        query: str,
+        internal: bool
     ) -> SavedQuery:
         """
         Save a query with its embedding for future reuse.
@@ -257,31 +256,33 @@ class QueryStore:
         Args:
             user_message: The original natural language query.
             query: The generated SQL query.
+            internal: Was this created manually to encourage this query for users
 
         Returns:
             The saved query object.
         """
         embedding = self.get_embedding(user_message)
         now = datetime.now()
+        query_id = uuid4()
 
-        insert_query = text("""
-            INSERT INTO saved_queries
-                (prompt_version, user_message, query, embedding, created_at, use_count)
+        insert_query = dedent("""
+            INSERT INTO nlporygon__saved_queries
+                (id, prompt_version, user_message, query, embedding, created_at, use_count, internal)
             VALUES
-                (:prompt_version, :user_message, :query, :embedding, :created_at, 0)
-            RETURNING id
+                (:id, :prompt_version, :user_message, :query, :embedding, :created_at, 0, :internal)
         """)
 
         params = {
+            "id": query_id,
             "prompt_version": self.prompt_version,
             "user_message": user_message,
             "query": query,
             "embedding": embedding,
             "created_at": now,
+            "internal": internal
         }
 
-        response = await self.db.execute(insert_query, query_params=params)
-        query_id = response[0]["id"]
+        await self.db.execute(insert_query, query_params=params, commit=True)
 
         logger.info("Saved query to store", user_message=user_message[:50])
 
