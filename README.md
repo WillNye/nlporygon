@@ -83,34 +83,37 @@ from anthropic import AsyncAnthropic
 from pathlib import Path
 from sqlalchemy import create_engine
 
-from nlporygon.models import Config, Database
+from nlporygon.config import Config
+from nlporygon.database import Database
 from nlporygon.schema_builder import generate_table_definitions
 from nlporygon.generate_prompt import generate_prompts
 from nlporygon.llm_agent import MainAgent
 
+
 async def main():
-    # 1. Connect to your database (any SQLAlchemy-supported backend)
-    db = Database(
-        name="analytics",
-        database_type="duckdb",
-        connection=create_engine("duckdb:///path/to/database.db")
-    )
+   # 1. Connect to your database (any SQLAlchemy-supported backend)
+   db = Database(
+      name="analytics",
+      database_type="duckdb",
+      connection=create_engine("duckdb:///path/to/database.db")
+   )
 
-    # 2. Configure nlporygon
-    config = Config(output_path=Path("./nlporygon_output"))
+   # 2. Configure nlporygon
+   config = Config(output_path=Path("./nlporygon_output"))
 
-    # 3. Generate schema definitions (run once, or when schema changes)
-    await generate_table_definitions(config, db)
+   # 3. Generate schema definitions (run once, or when schema changes)
+   await generate_table_definitions(config, db)
 
-    # 4. Generate compressed prompts
-    await generate_prompts(config, db)
+   # 4. Generate compressed prompts
+   await generate_prompts(config, db)
 
-    # 5. Query with natural language
-    agent = MainAgent(AsyncAnthropic(), config, db)
-    result = await agent.query("What are the top 10 customers by total order value?")
+   # 5. Query with natural language
+   agent = MainAgent(AsyncAnthropic(), config, db)
+   result = await agent.query("What are the top 10 customers by total order value?")
 
-    print(f"Generated SQL: {result.llm_response}")
-    print(f"Results: {result.db_data}")
+   print(f"Generated SQL: {result.llm_response}")
+   print(f"Results: {result.db_data}")
+
 
 asyncio.run(main())
 ```
@@ -126,29 +129,30 @@ Table definitions capture your schema structure—tables, columns, data types, a
 ```python
 from pathlib import Path
 from sqlalchemy import create_engine
-from nlporygon.models import Config, Database, ColumnConfig, TableConfig
+from nlporygon.database import Database
+from nlporygon.config import Config, ColumnConfig, TableConfig
 from nlporygon.schema_builder import generate_table_definitions
 
 # Connect to your database (any SQLAlchemy-supported backend)
 db = Database(
-    name="analytics",
-    database_type="duckdb",
-    connection=create_engine("duckdb:///path/to/analytics.db")
+   name="analytics",
+   database_type="duckdb",
+   connection=create_engine("duckdb:///path/to/analytics.db")
 )
 
 # Configure output and filtering
 config = Config(
-    output_path=Path("./output"),
-    column_relationships=ColumnConfig(
-        # Ignore columns that shouldn't be used for relationship detection
-        global_ignore_column_rules=["pii_column", "internal_column"]
-    ),
-    table_config=TableConfig(
-        # Only include tables matching these patterns
-        include_table_rules=["analytics.main.*"],
-        # Exclude internal/system tables
-        ignore_table_rules=["analytics.main.migrations.*"]
-    )
+   output_path=Path("./output"),
+   column_relationships=ColumnConfig(
+      # Ignore columns that shouldn't be used for relationship detection
+      global_ignore_column_rules=["pii_column", "internal_column"]
+   ),
+   table_config=TableConfig(
+      # Only include tables matching these patterns
+      include_table_rules=["analytics.main.*"],
+      # Exclude internal/system tables
+      ignore_table_rules=["analytics.main.migrations.*"]
+   )
 )
 
 # Generate definitions
@@ -261,7 +265,7 @@ print(f"Found {len(result.db_data)} customers")
 The main configuration object.
 
 ```python
-from nlporygon.models import Config, ColumnConfig, TableConfig, AgentConfig
+from nlporygon.config import Config, ColumnConfig, TableConfig, AgentConfig
 
 config = Config(
     # Required: where to store schema and prompt files
@@ -283,7 +287,8 @@ config = Config(
 Controls LLM behavior and query execution.
 
 ```python
-from nlporygon.models import AgentConfig
+
+from nlporygon.config import AgentConfig
 
 agent_config = AgentConfig(
     # Claude model version (default: claude-sonnet-4-5-20250929)
@@ -308,7 +313,8 @@ agent_config = AgentConfig(
 Controls relationship detection behavior.
 
 ```python
-from nlporygon.models import ColumnConfig
+
+from nlporygon.config import ColumnConfig
 
 column_config = ColumnConfig(
     # Columns to ignore when detecting relationships (e.g., tenant IDs)
@@ -330,7 +336,8 @@ column_config = ColumnConfig(
 Controls which tables to include and how to partition them.
 
 ```python
-from nlporygon.models import TableConfig, TablePartitionConfig, CommonTableRule
+
+from nlporygon.config import TablePartitionConfig, CommonTableRule, TableConfig
 
 table_config = TableConfig(
     # Regex patterns for tables to include (empty = include all)
@@ -392,20 +399,20 @@ nlporygon uses SQLAlchemy, so any SQLAlchemy-compatible database works out of th
 ```python
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import create_async_engine
-from nlporygon.models import Database
+from nlporygon.database import Database
 
 # Sync engine (most databases)
 db = Database(
-    name="mydb",
-    database_type="postgresql",
-    connection=create_engine("postgresql://user:pass@localhost/mydb")
+   name="mydb",
+   database_type="postgresql",
+   connection=create_engine("postgresql://user:pass@localhost/mydb")
 )
 
 # Async engine (for high-concurrency applications)
 db = Database(
-    name="mydb",
-    database_type="postgresql",
-    connection=create_async_engine("postgresql+asyncpg://user:pass@localhost/mydb")
+   name="mydb",
+   database_type="postgresql",
+   connection=create_async_engine("postgresql+asyncpg://user:pass@localhost/mydb")
 )
 ```
 

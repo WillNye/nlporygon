@@ -16,6 +16,7 @@ dependencies = [
     "orjson>=3.11.7",
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.1",
+    "pytz>=2025.2",
     "pyyaml>=6.0.3",
     "rbloom>=1.5.4",
     "sentence-transformers>=2.2.0",
