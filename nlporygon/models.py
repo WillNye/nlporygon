@@ -34,6 +34,10 @@ class Database(BaseModel):
 
     model_config = {"arbitrary_types_allowed": True}
 
+    @property
+    def is_async(self) -> bool:
+        return isinstance(self.connection, AsyncEngine)
+
     async def execute(
         self,
         query: str,
@@ -50,16 +54,16 @@ class Database(BaseModel):
         Returns:
             List of dicts, one per row, with column names as keys.
         """
-        if isinstance(self.connection, Engine):
-            with self.connection.connect() as conn:
-                result = conn.execute(
+        if self.is_async:
+            async with self.connection.connect() as conn:
+                result = await conn.execute(
                     text(query),
                     query_params or {}
                 )
                 rows = result.fetchall()
         else:
-            async with self.connection.connect() as conn:
-                result = await conn.execute(
+            with self.connection.connect() as conn:
+                result = conn.execute(
                     text(query),
                     query_params or {}
                 )
@@ -151,6 +155,14 @@ class Config(BaseModel):
     column_relationships: Optional[ColumnConfig] = Field(default_factory=ColumnConfig, exclude_if=is_empty_val)
     table_config: Optional[TableConfig] = Field(default_factory=TableConfig, exclude_if=is_empty_val)
 
+    _prompt_config: Optional["PromptConfig"] = None
+
+    async def get_prompt_config(self) -> "PromptConfig":
+        if self._prompt_config is None:
+            self._prompt_config = await PromptConfig.load(self.prompt_path)
+
+        return self._prompt_config
+
     @property
     def schema_path(self) -> Path:
         path = self.output_path / "schema"
@@ -236,6 +248,30 @@ class Table(BaseModel):
                 if p.is_file() and (p.name.endswith(".yaml") or p.name.endswith(".yml"))
             ]
         )
+
+
+class PromptConfig(BaseModel):
+    prompt_version: str
+
+    async def write(self, path: Path):
+        file_name = "prompt_config.yaml"
+        data = yaml.dump(
+            self.model_dump(exclude_none=True),
+            sort_keys=False,
+            Dumper=YamlDump,
+            default_flow_style=False
+        )
+        async with aiofiles.open(path.joinpath(file_name), "w") as f:
+            await f.write(data)
+
+    @classmethod
+    async def load(cls, path: Path) -> "PromptConfig":
+        file_name = "prompt_config.yaml"
+        async with aiofiles.open(path / file_name) as f:
+            content = await f.read()
+            return cls.model_validate(
+                yaml.safe_load(content)
+            )
 
 
 class SchemaAlias(BaseModel):

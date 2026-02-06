@@ -18,6 +18,7 @@ from anthropic.types import TextBlockParam, CacheControlEphemeralParam, MessageP
 
 from nlporygon.logger import logger
 from nlporygon.models import Config, Database, AgentConfig
+from nlporygon.query_store import QueryStore
 
 # Prefix for intermediate queries where LLM requests data (e.g., enum values) before final SQL
 CONTEXT_FLAG = "INTERNAL_CONTEXT_QUERY"
@@ -180,11 +181,15 @@ class DbAgent:
 @dataclasses.dataclass
 class MainAgent(DbAgent):
     """
-    Extends DbAgent to support partitioned schemas.
+    Extends DbAgent to support partitioned schemas and query caching.
 
     When multiple partitions exist, uses an LLM call to route incoming queries
     to the appropriate partition's agent based on the query content.
+
+    If a query_store is provided, checks for semantically similar saved queries
+    before invoking the LLM.
     """
+    query_store: Optional[QueryStore] = None
     _partition_agent_map: Optional[dict] = None
     _partition_name_map: Optional[dict] = None
 
@@ -215,6 +220,22 @@ class MainAgent(DbAgent):
         return self._partition_name_map
 
     async def query(self, message: str) -> AgentResponse:
+        # Check saved queries first (if query_store is configured)
+        if self.query_store:
+            cached = await self.query_store.lookup(message)
+            if cached:
+                logger.info("Using cached query", similarity_match=cached.user_message[:50])
+                try:
+                    db_data = await self.db.execute(cached.query)
+                    return AgentResponse(
+                        user_prompt=message,
+                        llm_response=cached.query,
+                        db_data=db_data
+                    )
+                except Exception as e:
+                    logger.warning("Cached query execution failed, falling back to LLM", error=str(e))
+
+        # Normal flow: route to partition and generate query
         partition_agent_map = self.partition_agent_map
         if len(partition_agent_map) == 1:
             agent = list(partition_agent_map.values())[0]
@@ -224,7 +245,14 @@ class MainAgent(DbAgent):
             logger.info("Routed query to partition", partition=partition_name)
             agent = partition_agent_map[partition_name]
 
-        return await agent.query(message)
+        response = await agent.query(message)
+        if self.query_store and response.db_data:
+            await self.query_store.save(
+                message,
+                response.llm_response,
+            )
+
+        return response
 
     async def _select_partition(self, message: str) -> str:
         """Use LLM to select the best partition for the given query."""

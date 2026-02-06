@@ -5,12 +5,13 @@ Replaces verbose table/column/type names with short aliases (t<A>, c<B>, d<C>) t
 reduce token count while preserving schema structure. Outputs a system prompt plus
 legend files that map aliases back to real names for post-processing LLM responses.
 """
+import uuid
 from pathlib import Path
 
 import aiofiles
 from jinja2 import Template
 
-from nlporygon.models import Config, Table, SchemaAlias, Database, TablePartitionConfig
+from nlporygon.models import Config, Table, SchemaAlias, Database, TablePartitionConfig, PromptConfig
 
 
 def int_to_str(n: int) -> str:
@@ -128,6 +129,11 @@ async def generate_prompts(config: Config, db: Database):
             await f.write(prompt)
 
         await create_legends(path, schema_alias)
+
+    prompt_config = PromptConfig(
+        prompt_version=uuid.uuid4().hex
+    )
+    await prompt_config.write(config.prompt_path)
 
 
 def _compress_schema(
