@@ -13,10 +13,13 @@ import uuid
 from textwrap import dedent
 from typing import Union, Any
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from nlporygon.column_relationship import set_column_relationship
 from nlporygon.logger import logger
-from nlporygon.models import Database, Table, TableColumn, Config
-from nlporygon.utils import get_query, is_date_or_dt_column, get_table_name
+from nlporygon.schema import Table, TableColumn
+from nlporygon.config import Config
+from nlporygon.database import Database, get_query, is_date_or_dt_column, get_table_name
 
 PYTHON_TO_SQL_TYPE_MAP = {
     # Python built-ins
@@ -105,7 +108,7 @@ async def _get_tables(db: Database) -> list[dict]:
 
         try:
             await db.execute(f"SELECT * FROM {table_name} LIMIT 100")
-        except Exception as e:
+        except (SQLAlchemyError, asyncio.TimeoutError) as e:
             logger.warning(f"Failed to get table", table=table_name, error=e)
             missing_tables.add(table_name)
             continue
@@ -198,6 +201,58 @@ async def upsert_table_ordering(
     logger.info("Setting default query order complete")
 
 
+def _upsert_nested_columns(
+    column: TableColumn,
+    key: str,
+    val: Union[dict, list]
+):
+    if isinstance(val, list):
+        if len(val) > 0 and isinstance(val[0], dict):
+            val = val[0]
+        else:
+            return
+
+    for k, v in val.items():
+        if v is None:
+            continue
+
+        k = f"{key}->{k}"
+        nested_col = None
+        if nested_cols := [x for x in column.nested_columns if x.name == k]:
+            nested_col = nested_cols[0]
+            if (
+                not nested_col.data_type.startswith("JSON")
+                and not nested_col.data_type.endswith("[]")
+            ):
+                continue
+
+        if isinstance(v, str):
+            try:
+                v = json.loads(v)
+            except json.decoder.JSONDecodeError:
+                pass
+
+        if isinstance(v, dict) or isinstance(v, list):
+            _dt = _get_data_type(v)
+            if not _dt:
+                continue
+            elif _dt.startswith("JSON"):
+                _upsert_nested_columns(column, k, v)
+        else:
+            _dt = PYTHON_TO_SQL_TYPE_MAP[type(v)]
+
+        if nested_col and nested_col.data_type != _dt:
+            # The default cast because it's the safest
+            nested_col.data_type = "VARCHAR"
+        elif not nested_col:
+            column.nested_columns.append(
+                TableColumn(
+                    name=k,
+                    data_type=_dt,
+                )
+            )
+
+
 async def _set_sub_data_type(
     db: Database,
     table: Table,
@@ -210,52 +265,6 @@ async def _set_sub_data_type(
     the LLM knows to cast it. For JSON columns, recursively builds nested_columns to
     expose the internal structure. Clears sub_data_type if values are inconsistent.
     """
-    def _upsert_nested_columns(_val: Union[dict, list], key: str):
-        if isinstance(_val, list):
-            if len(_val) > 0 and isinstance(_val[0], dict):
-                _val = _val[0]
-            else:
-                return
-
-        for k, v in _val.items():
-            if v is None:
-                continue
-
-            k = f"{key}->{k}"
-            nested_col = None
-            if nested_cols := [x for x in column.nested_columns if x.name == k]:
-                nested_col = nested_cols[0]
-                if (
-                    not nested_col.data_type.startswith("JSON")
-                    and not nested_col.data_type.endswith("[]")
-                ):
-                    continue
-
-            if isinstance(v, str):
-                try:
-                    v = json.loads(v)
-                except json.decoder.JSONDecodeError:
-                    pass
-
-            if isinstance(v, dict) or isinstance(v, list):
-                _dt = _get_data_type(v)
-                if not _dt:
-                    continue
-                elif _dt.startswith("JSON"):
-                    _upsert_nested_columns(v, k)
-            else:
-                _dt = PYTHON_TO_SQL_TYPE_MAP[type(v)]
-
-            if nested_col and nested_col.data_type != _dt:
-                # The default cast because it's the safest
-                nested_col.data_type = "VARCHAR"
-            elif not nested_col:
-                column.nested_columns.append(
-                    TableColumn(
-                        name=k,
-                        data_type=_dt,
-                    )
-                )
 
     sample_data = await db.execute(dedent(f"""
     SELECT DISTINCT {column.query_name} 
@@ -289,7 +298,7 @@ async def _set_sub_data_type(
             return
 
         if sub_data_type.startswith("JSON"):
-            _upsert_nested_columns(val, column.name)
+            _upsert_nested_columns(column, column.name, val)
 
 
 def _get_data_type(
@@ -307,7 +316,11 @@ def _get_data_type(
         elif inner_types[0] == dict:
             inner_type = "JSON"
         else:
-            inner_type = PYTHON_TO_SQL_TYPE_MAP[inner_types[0]]
+            try:
+                inner_type = PYTHON_TO_SQL_TYPE_MAP[inner_types[0]]
+            except KeyError:
+                logger.info(f"Unrecognized SQL type, falling back to VARCHAR", sql_type=inner_types[0])
+                inner_type = "VARCHAR"
 
         return f"{inner_type}[]"
 

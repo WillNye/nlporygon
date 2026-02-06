@@ -15,78 +15,20 @@ import orjson
 from anthropic import AsyncAnthropic
 from pydantic import BaseModel
 from anthropic.types import TextBlockParam, CacheControlEphemeralParam, MessageParam
+from sqlalchemy.exc import SQLAlchemyError
 
 from nlporygon.logger import logger
-from nlporygon.models import Config, Database, AgentConfig
+from nlporygon.database import Database
+from nlporygon.config import AgentConfig, Config
 from nlporygon.query_store import QueryStore
+from nlporygon.sql_validator import UnsafeSQLError, validate_sql
 
 # Prefix for intermediate queries where LLM requests data (e.g., enum values) before final SQL
 CONTEXT_FLAG = "INTERNAL_CONTEXT_QUERY"
+CONTEXT_QUERY_MAX_RESULTS = 50
 
 # Pre-compiled forbidden SQL patterns for efficient validation
 # Each tuple: (compiled_pattern, human_readable_name)
-_FORBIDDEN_PATTERNS: list[tuple[re.Pattern, str]] = [
-    # DDL statements
-    (re.compile(r'\b(CREATE|ALTER|DROP)\s+(TABLE|INDEX|VIEW|DATABASE|SCHEMA|FUNCTION|PROCEDURE|TRIGGER)\b', re.IGNORECASE), 'DDL statement'),
-    (re.compile(r'\bTRUNCATE\s+TABLE\b', re.IGNORECASE), 'TRUNCATE statement'),
-
-    # DML statements (non-SELECT)
-    (re.compile(r'\bINSERT\s+INTO\b', re.IGNORECASE), 'INSERT statement'),
-    (re.compile(r'\bUPDATE\s+\w+\s+SET\b', re.IGNORECASE), 'UPDATE statement'),
-    (re.compile(r'\bDELETE\s+FROM\b', re.IGNORECASE), 'DELETE statement'),
-    (re.compile(r'\bMERGE\s+INTO\b', re.IGNORECASE), 'MERGE statement'),
-
-    # Permission/access control
-    (re.compile(r'\b(GRANT|REVOKE)\b', re.IGNORECASE), 'Permission statement'),
-
-    # Transaction control
-    (re.compile(r'\b(COMMIT|ROLLBACK)\b', re.IGNORECASE), 'Transaction control'),
-
-    # Dangerous functions/commands
-    (re.compile(r'\bEXEC(UTE)?\s*\(', re.IGNORECASE), 'EXECUTE statement'),
-    (re.compile(r'\b(XP_|SP_|DBMS_|UTL_)\w+', re.IGNORECASE), 'Stored procedure'),
-    (re.compile(r'\bLOAD\s+DATA\b', re.IGNORECASE), 'LOAD DATA statement'),
-    (re.compile(r'\bINTO\s+(OUTFILE|DUMPFILE)\b', re.IGNORECASE), 'File output clause'),
-
-    # SQL injection patterns
-    (re.compile(r';\s*(SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|TRUNCATE)', re.IGNORECASE), 'Multiple statements'),
-    (re.compile(r'--\s*$', re.IGNORECASE), 'SQL comment injection'),
-    (re.compile(r'/\*.*\*/', re.IGNORECASE), 'Block comment injection'),
-    (re.compile(r'\bUNION\s+ALL\s+SELECT\s+NULL', re.IGNORECASE), 'UNION NULL injection'),
-    (re.compile(r"'\s*OR\s+'?1'?\s*=\s*'?1|OR\s+'1'\s*=\s*'1'", re.IGNORECASE), 'OR 1=1 injection'),
-    (re.compile(r'\bSLEEP\s*\(\d+\)', re.IGNORECASE), 'SLEEP timing attack'),
-    (re.compile(r'\bBENCHMARK\s*\(', re.IGNORECASE), 'BENCHMARK timing attack'),
-    (re.compile(r'\bWAITFOR\s+DELAY\b', re.IGNORECASE), 'WAITFOR timing attack'),
-
-    # File system access
-    (re.compile(r'\b(READ_FILE|WRITE_FILE|LOAD_FILE)\s*\(', re.IGNORECASE), 'File access function'),
-]
-
-
-class UnsafeSQLError(Exception):
-    """Raised when LLM generates SQL that contains forbidden/dangerous patterns."""
-
-    def __init__(self, message: str, pattern_name: str, sql: str):
-        self.pattern_name = pattern_name
-        self.sql = sql
-        super().__init__(message)
-
-
-def _validate_sql_safety(sql: str) -> None:
-    """
-    Check SQL for dangerous patterns and raise UnsafeSQLError if found.
-
-    Uses pre-compiled regex patterns for efficiency. This is a defense-in-depth
-    measure - the LLM should only generate SELECT statements, but this catches
-    any attempts at DDL, DML, or injection.
-    """
-    for pattern, name in _FORBIDDEN_PATTERNS:
-        if pattern.search(sql):
-            raise UnsafeSQLError(
-                f"Unsafe SQL detected: {name}",
-                pattern_name=name,
-                sql=sql
-            )
 
 
 def _sanitize_llm_response(response) -> str:
@@ -109,7 +51,7 @@ def _sanitize_llm_response(response) -> str:
     llm_response = llm_response.strip()
 
     # Validate SQL is safe before returning
-    _validate_sql_safety(llm_response)
+    validate_sql(llm_response)
 
     return llm_response
 
@@ -203,6 +145,46 @@ class DbAgent:
 
         return llm_response
 
+    async def _run_context_queries(
+        self,
+        user_message: str,
+        agent_query: str,
+        message_history: list[MessageParam]
+    ) -> str:
+        context_queries = 0
+
+        while agent_query.startswith(CONTEXT_FLAG) and context_queries < self.agent_config.max_context_queries:
+            context_queries += 1
+            logger.debug("Processing context query", context_query_num=context_queries)
+            try:
+                db_data = await self.db.execute(
+                    _set_query_limit_offset(
+                        agent_query.replace(CONTEXT_FLAG, ""),
+                        CONTEXT_QUERY_MAX_RESULTS
+                    )
+                )
+                if db_data:
+                    msg = orjson.dumps(db_data).decode()
+                else:
+                    msg = "The query didn't return any data."
+
+                return await self._send_message(
+                    msg,
+                    message_history
+                )
+            except UnsafeSQLError as e:
+                message_prefix = f"The query you wrote is unsafe: {e}. "
+            except SQLAlchemyError as e:
+                logger.warning("Context query failed", error=str(e))
+                message_prefix = f"The query you wrote is unsafe: {e}. "
+
+            agent_query = await self._send_message(
+                f"{message_prefix}{user_message}",
+                message_history
+            )
+
+        return ""
+
     async def query(
         self,
         message: str,
@@ -223,7 +205,6 @@ class DbAgent:
         response = AgentResponse(user_prompt=message, llm_response="", db_data=[])
 
         while current_attempt < self.agent_config.max_query_attempts:
-            context_queries = 0
             current_attempt += 1
             logger.debug("Sending query to LLM", attempt=current_attempt)
 
@@ -236,37 +217,11 @@ class DbAgent:
                 message_prefix = f"The query you wrote is unsafe: {e}. "
                 continue
 
-            while q_response.startswith(CONTEXT_FLAG) and context_queries < self.agent_config.max_context_queries:
-                context_queries += 1
-                logger.debug("Processing context query", context_query_num=context_queries)
-                try:
-                    db_data = await self.db.execute(
-                        _set_query_limit_offset(
-                            q_response.replace(CONTEXT_FLAG, ""),
-                            1000
-                        )
-                    )
-                    if db_data:
-                        msg = orjson.dumps(db_data).decode()
-                    else:
-                        msg = "The query didn't return any data."
-
-                    q_response = await self._send_message(
-                        msg,
-                        message_history
-                    )
-                except UnsafeSQLError as e:
-                    message_prefix = f"The query you wrote is unsafe: {e}. "
-                    q_response = None
-                    break
-                except Exception as e:
-                    logger.warning("Context query failed", error=str(e))
-                    q_response = await self._send_message(
-                        f"The context query failed with the error: {e}",
-                        message_history
-                    )
-                    break
-
+            q_response = await self._run_context_queries(
+                message,
+                q_response,
+                message_history
+            )
             if not q_response:
                 continue
 
@@ -282,7 +237,7 @@ class DbAgent:
                     return response
                 logger.debug("Query returned no data, retrying")
                 message_prefix = "The query didn't return any data. Look closely at the query and try again. "
-            except Exception as e:
+            except SQLAlchemyError as e:
                 logger.warning("Query execution failed", attempt=current_attempt, error=str(e))
                 message_prefix = f"The query failed with the error: {e}. "
 

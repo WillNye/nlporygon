@@ -12,10 +12,12 @@ from typing import Union
 
 from pydantic import BaseModel, ConfigDict
 from rbloom import Bloom
+from sqlalchemy.exc import SQLAlchemyError
 
 from nlporygon.logger import logger
-from nlporygon.models import Database, Table, TableColumn, ColumnRelationship, Config
-from nlporygon.utils import is_date_or_dt_column, format_sql_value, get_query, get_table_name
+from nlporygon.schema import Table, TableColumn, ColumnRelationship
+from nlporygon.database import Database, get_query, is_date_or_dt_column, format_sql_value, get_table_name
+from nlporygon.config import Config
 
 
 async def set_column_relationship(
@@ -186,6 +188,127 @@ async def create_column_bloom_map(
     return response
 
 
+def _relationship_exists(
+    p_col: TableColumn,
+    sec_col: TableColumn,
+    primary_table: str,
+    secondary_table: str
+) -> bool:
+    """Returns True if relationship already exists in either direction."""
+    forward = any(
+        r.table == secondary_table and r.column == sec_col.name
+        for r in p_col.relationships
+    )
+    reverse = any(
+        r.table == primary_table and r.column == p_col.name
+        for r in sec_col.relationships
+    )
+    return forward or reverse
+
+
+def _is_valid_relationship_candidate(
+    p_col_bloom: ColumnBloom,
+    sec_col_bloom: ColumnBloom,
+    primary_table: str,
+    secondary_table: str
+) -> bool:
+    """Returns True if columns could have a FK→PK relationship."""
+    if p_col_bloom.column.data_type != sec_col_bloom.column.data_type:
+        return False
+
+    if _relationship_exists(
+        p_col_bloom.column, sec_col_bloom.column,
+        primary_table, secondary_table
+    ):
+        return False
+
+    if p_col_bloom.unique_value_count < sec_col_bloom.unique_value_count:
+        return False
+
+    return True
+
+
+async def _verify_missing_values(
+    db: Database,
+    primary_table: str,
+    p_col: TableColumn,
+    missing_values: list
+) -> bool:
+    """
+    Verifies that values missing from bloom filter actually exist in primary table.
+    Returns True if all missing values are found (bloom false positives).
+    """
+    if not missing_values:
+        return True
+
+    try:
+        # Quick single-value check first
+        exists = await db.execute(dedent(f"""
+            SELECT 1
+            FROM {primary_table}
+            WHERE {p_col.query_name} = {format_sql_value(missing_values[0])}
+            LIMIT 1
+        """))
+        if not exists:
+            return False
+
+        # Full check for all missing values
+        db_results = await db.execute(dedent(f"""
+            SELECT DISTINCT {p_col.query_name}
+            FROM {primary_table}
+            WHERE {p_col.query_name} IN {format_sql_value(missing_values)}
+        """))
+        return len(db_results) == len(missing_values)
+
+    except SQLAlchemyError as e:
+        logger.warning(
+            "Unable to verify missing values",
+            table=primary_table,
+            column=p_col.name,
+            error=str(e),
+        )
+        return False
+
+
+async def _find_relationships_for_column(
+    db: Database,
+    tables: list[Table],
+    column_bloom_map: dict[str, dict[str, ColumnBloom]],
+    primary_table: Table,
+    p_col_bloom: ColumnBloom,
+):
+    """Finds all FK relationships pointing to the given primary column."""
+    p_col = p_col_bloom.column
+    p_bloom = p_col_bloom.bloom
+
+    for secondary_table in tables:
+        if secondary_table.name == primary_table.name:
+            continue
+
+        secondary_bloom_map = column_bloom_map[secondary_table.name]
+        for sec_col_bloom in secondary_bloom_map.values():
+            if not _is_valid_relationship_candidate(
+                p_col_bloom, sec_col_bloom,
+                primary_table.name, secondary_table.name
+            ):
+                continue
+
+            missing_values = [
+                val for val in sec_col_bloom.sample_data
+                if str(val) not in p_bloom
+            ]
+            if not await _verify_missing_values(db, primary_table.name, p_col, missing_values):
+                continue
+
+            # Add relationship: FK column → PK column
+            sec_col_bloom.column.relationships.append(
+                ColumnRelationship(
+                    table=primary_table.name,
+                    column=p_col.name
+                )
+            )
+
+
 async def bloom_filter_column_relationship(
     config: Config,
     db: Database,
@@ -199,105 +322,19 @@ async def bloom_filter_column_relationship(
     checks, then verifies bloom "maybe present" results with actual DB queries.
     Relationships are added from the secondary (FK) column pointing to the primary (PK).
     """
-    column_bloom_map = await create_column_bloom_map(
-        config,
-        db,
-        tables,
-    )
+    column_bloom_map = await create_column_bloom_map(config, db, tables)
+    tables = [t for t in tables if t.name in column_bloom_map]
 
-    tables = [
-        t
-        for t in tables
-        if t.name in column_bloom_map
-    ]
-
-    for primary_idx in range(len(tables)):
-        primary_table = tables[primary_idx]
-
-        logger.debug(
-            "Detecting undefined foreign key relationships",
-            table=primary_table.name,
-        )
-
+    for primary_table in tables:
+        logger.debug("Detecting undefined FK relationships", table=primary_table.name)
         primary_bloom_map = column_bloom_map[primary_table.name]
+
         for p_col_bloom in primary_bloom_map.values():
-            # Only columns where every value is unique can be the "one" side of a relationship
-            if p_col_bloom.total_count != p_col_bloom.unique_value_count:
-                # There's non-unique values so it's not a primary key
+            if not p_col_bloom.total_count == p_col_bloom.unique_value_count:
                 continue
 
-            p_col = p_col_bloom.column
-            p_bloom = p_col_bloom.bloom
-
-            for secondary_idx in range(len(tables)):
-                if primary_idx == secondary_idx:
-                    continue  # Skip self-references
-
-                secondary_table = tables[secondary_idx]
-                secondary_bloom_map = column_bloom_map[secondary_table.name]
-                for sec_col_bloom in secondary_bloom_map.values():
-                    sec_col = sec_col_bloom.column
-
-                    if p_col_bloom.column.data_type != sec_col_bloom.column.data_type:
-                        continue
-                    elif any(
-                        r.table == secondary_table.name
-                        and r.column == sec_col.name
-                        for r in p_col.relationships
-                    ):
-                        continue
-                    elif any(
-                        r.table == primary_table.name
-                        and r.column == p_col.name
-                        for r in sec_col.relationships
-                    ):
-                        continue
-                    elif p_col_bloom.unique_value_count < sec_col_bloom.unique_value_count:
-                        continue
-
-                    missing_values = []
-                    for val in sec_col_bloom.sample_data:
-                        if str(val) not in p_bloom:
-                            missing_values.append(val)
-
-                    if missing_values:
-                        try:
-                            if not await db.execute(
-                                dedent(f"""
-                                SELECT 1
-                                FROM {primary_table.name}
-                                WHERE {p_col.query_name} = {format_sql_value(missing_values[0])}
-                                LIMIT 1
-                                """),
-                            ):
-                                # Quick check before longer check
-                                continue
-
-                            db_results = await db.execute(
-                                dedent(f"""
-                                SELECT DISTINCT {p_col.query_name}
-                                FROM {primary_table.name}
-                                WHERE {p_col.query_name} IN {format_sql_value(missing_values)}
-                                """),
-                            )
-                            if len(db_results) != len(missing_values):
-                                continue
-                        except Exception as e:
-                            logger.warning(
-                                "Unable to perform column compare",
-                                primary_table=primary_table.name,
-                                primary_column=p_col.name,
-                                child_table=secondary_table.name,
-                                child_column=sec_col.name,
-                                error=e,
-                            )
-                            continue
-
-                    sec_col = sec_col_bloom.column
-                    sec_col.relationships.append(
-                        ColumnRelationship(
-                            table=primary_table.name,
-                            column=p_col.name
-                        )
-                    )
+            await _find_relationships_for_column(
+                db, tables, column_bloom_map,
+                primary_table, p_col_bloom
+            )
 

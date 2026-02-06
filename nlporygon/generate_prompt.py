@@ -11,7 +11,9 @@ from pathlib import Path
 import aiofiles
 from jinja2 import Template
 
-from nlporygon.models import Config, Table, SchemaAlias, Database, TablePartitionConfig, PromptConfig
+from nlporygon.schema import Table, SchemaAlias
+from nlporygon.database import Database
+from nlporygon.config import Config, TablePartitionConfig, PromptConfig
 
 
 def int_to_str(n: int) -> str:

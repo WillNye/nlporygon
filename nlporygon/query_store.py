@@ -5,7 +5,8 @@ Stores generated SQL queries with their embeddings for future reuse.
 Uses sentence-transformers for embedding generation and FAISS for
 efficient in-memory similarity search at scale (100k+ queries).
 """
-from datetime import datetime
+import datetime as dt
+from pathlib import Path
 from textwrap import dedent
 from typing import Optional
 from uuid import UUID, uuid4
@@ -19,7 +20,10 @@ from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql.sqltypes import Boolean, Integer
 
 from nlporygon.logger import logger
-from nlporygon.models import Database
+from nlporygon.database import Database
+
+# Default local path for embedding model cache
+DEFAULT_MODEL_PATH = Path.home() / ".nlporygon" / "models"
 
 Base = declarative_base()
 
@@ -33,7 +37,7 @@ class SavedQueryModel(Base):
     user_message = Column(Text, nullable=False)
     query = Column(Text, nullable=False)
     embedding = Column(JSON, nullable=False)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, default=dt.datetime.now)
     last_used_at = Column(DateTime, nullable=True)
     use_count = Column(Integer, default=0)
     internal = Column(Boolean, nullable=False, default=False)
@@ -46,8 +50,8 @@ class SavedQuery(BaseModel):
     user_message: str
     query: str
     embedding: list[float]
-    created_at: datetime
-    last_used_at: Optional[datetime] = None
+    created_at: dt.datetime
+    last_used_at: Optional[dt.datetime] = None
     use_count: int = 0
     internal: bool = False
 
@@ -72,8 +76,10 @@ class QueryStore:
         self,
         connection: Database,
         prompt_version: str,
+        expire_unused_query_after_days: int = 14,
         similarity_threshold: float = 0.85,
-        model_name: str = "all-MiniLM-L6-v2"
+        model_name: str = "all-MiniLM-L6-v2",
+        model_path: Optional[Path] = None
     ):
         """
         Initialize the query store.
@@ -82,23 +88,45 @@ class QueryStore:
             connection: SQLAlchemy engine (sync or async) for query storage.
             similarity_threshold: Minimum cosine similarity to consider a match (0-1).
             model_name: Sentence transformer model for embeddings.
+            model_path: Local directory to store/load embedding model.
+                        Defaults to ~/.nlporygon/models.
         """
         self.db = connection
         self.similarity_threshold = similarity_threshold
         self._model: Optional[SentenceTransformer] = None
         self._model_name = model_name
+        self._model_path = model_path or DEFAULT_MODEL_PATH
         self.prompt_version = prompt_version
+
+        self.expire_unused_query_after_days = expire_unused_query_after_days
 
         # FAISS index state
         self._index: Optional[faiss.IndexFlatIP] = None
         self._index_id_map: dict[int, UUID] = {}  # faiss_idx -> db_id
 
+        self._next_prune_time = dt.datetime.now(tz=dt.UTC)
+
+    async def setup(self):
+        await self._create_tables()
+        await self._build_index()
+
     @property
     def model(self) -> SentenceTransformer:
-        """Lazy-load embedding model on first use."""
+        """Lazy-load embedding model, downloading to local cache if needed."""
         if self._model is None:
-            logger.info("Loading embedding model", model=self._model_name)
-            self._model = SentenceTransformer(self._model_name)
+            local_model_dir = self._model_path / self._model_name
+
+            if local_model_dir.exists():
+                logger.info("Loading embedding model from local cache", path=str(local_model_dir))
+                self._model = SentenceTransformer(str(local_model_dir))
+            else:
+                logger.info("Downloading embedding model", model=self._model_name)
+                self._model = SentenceTransformer(self._model_name)
+                # Save to local cache for future use
+                local_model_dir.parent.mkdir(parents=True, exist_ok=True)
+                self._model.save(str(local_model_dir))
+                logger.info("Saved embedding model to local cache", path=str(local_model_dir))
+
         return self._model
 
     def get_embedding(self, text: str) -> list[float]:
@@ -151,7 +179,7 @@ class QueryStore:
             return SavedQuery(**results[0])
         return None
 
-    async def create_tables(self) -> None:
+    async def _create_tables(self) -> None:
         """Create the nlporygon__saved_queries table if it doesn't exist."""
 
         if self.db.is_async:
@@ -185,11 +213,24 @@ class QueryStore:
             WHERE id = :id
         """)
 
-        await self.db.execute(query, {"now": datetime.utcnow(), "id": query_id}, commit=True)
+        await self.db.execute(query, {"now": dt.datetime.now(tz=dt.UTC), "id": query_id}, commit=True)
 
-    async def prune_table(self):
+    async def maybe_prune_table(self):
         # Remove queries not being used
-        ...
+        cur_time = dt.datetime.now(tz=dt.UTC)
+        if self._next_prune_time <= cur_time:
+            logger.info("Pruning table")
+            self._next_prune_time = cur_time + dt.timedelta(days=1)
+
+            await self.db.execute(
+                "DELETE FROM nlporygon__saved_queries "
+                "WHERE (last_used_at = :max_age OR prompt_version != :prompt_version) AND internal IS FALSE",
+                {
+                    "max_age": cur_time - dt.timedelta(days=self.expire_unused_query_after_days),
+                    "prompt_version": self.prompt_version
+                },
+                commit=True,
+            )
 
     async def lookup(
         self,
@@ -208,12 +249,10 @@ class QueryStore:
         Returns:
             The best matching SavedQuery if similarity >= threshold, else None.
         """
-        # Rebuild index if prompt version changed or not initialized
-        if self._index is None:
-            await self._build_index()
-
         if self._index.ntotal == 0:
             return None
+
+        await self.maybe_prune_table()
 
         # Get query embedding and normalize for cosine similarity
         query_embedding = np.array([self.get_embedding(message)], dtype=np.float32)
@@ -262,14 +301,14 @@ class QueryStore:
             The saved query object.
         """
         embedding = self.get_embedding(user_message)
-        now = datetime.now()
+        now = dt.datetime.now(tz=dt.UTC)
         query_id = uuid4()
 
         insert_query = dedent("""
             INSERT INTO nlporygon__saved_queries
-                (id, prompt_version, user_message, query, embedding, created_at, use_count, internal)
+                (id, prompt_version, user_message, query, embedding, created_at, last_used_at, use_count, internal)
             VALUES
-                (:id, :prompt_version, :user_message, :query, :embedding, :created_at, 0, :internal)
+                (:id, :prompt_version, :user_message, :query, :embedding, :created_at, :last_used_at, 0, :internal)
         """)
 
         params = {
@@ -279,6 +318,7 @@ class QueryStore:
             "query": query,
             "embedding": embedding,
             "created_at": now,
+            "last_used_at": now,
             "internal": internal
         }
 
